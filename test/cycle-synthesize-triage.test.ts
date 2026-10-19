@@ -121,6 +121,23 @@ describe('runTriagePass — cache validity (C8)', () => {
     expect(rows.get(`${t.filePath}|${t.contentHash}`)?.triage_version).toBe(TRIAGE_VERSION);
   });
 
+  test('a verdict a chat_fallback_chain model gave decides this run but is never cached', async () => {
+    const fake = makeFakeEngine();
+    const t = makeTranscript('fallback');
+    const judge: JudgeClient = {
+      create: async () => ({
+        content: [{ type: 'text', text: JSON.stringify({ score: 0.7, reasons: ['mock'] }) }],
+        stop_reason: 'end_turn',
+        answered_by: 'openai:gpt-example',
+      } as never),
+    };
+    const r = await runTriagePass(fake.engine, [t], baseCfg(judge));
+    expect(r.judged).toBe(1);
+    expect(fake.putCalls).toBe(0);
+    expect(r.reports[0]?.score).toBe(0.7);
+    expect(r.reports[0]?.worth).toBe(true);
+  });
+
   test('model mismatch is a MISS — switching models re-judges (C8)', async () => {
     const { engine, rows } = makeFakeEngine();
     const t = makeTranscript('model-switch');
@@ -170,6 +187,107 @@ describe('runTriagePass — gate + threshold', () => {
     seedVerdict(rows, t, { score: 0 });
     const r = await runTriagePass(engine, [t], baseCfg(null, { threshold: 0 }));
     expect(r.reports[0].worth).toBe(true);
+  });
+});
+
+describe('runTriagePass — F2 verified-segment rescue at report construction', () => {
+  // A transcript whose content contains two substantive passages the judge
+  // can quote verbatim — the buried-signal shape.
+  const BURIED = makeTranscript('buried', [
+    'routine chatter about scheduling and lunch orders. ',
+    'I keep thinking our retention problem is actually an onboarding problem in disguise. ',
+    'more routine chatter. ',
+    'Decision: we kill the referral program next quarter because it cannibalizes organic signups. ',
+  ].join(''));
+  const SEGMENTS = [
+    { quote: 'our retention problem is actually an onboarding problem in disguise' },
+    { quote: 'we kill the referral program next quarter because it cannibalizes organic signups' },
+  ];
+
+  test('cached band verdict with verified segments → worth=true, rescued flagged (works on CACHED rows — no re-judge)', async () => {
+    const fake = makeFakeEngine();
+    seedVerdict(fake.rows, BURIED, { score: 0.35, content_type: 'mixed', segments: SEGMENTS });
+    const r = await runTriagePass(fake.engine, [BURIED], baseCfg(null));
+    expect(fake.putCalls).toBe(0); // rescue is gate-time: cached verdict, zero LLM
+    expect(r.reports[0].worth).toBe(true);
+    expect(r.reports[0].rescued).toBe(true);
+    expect(r.reports[0].verified_segments).toBe(2);
+  });
+
+  test('fresh band verdict rescues the same way (judge returns segments)', async () => {
+    const { engine } = makeFakeEngine();
+    const judge = scoredJudge(0.4, { content_type: 'mixed', segments: SEGMENTS });
+    const r = await runTriagePass(engine, [BURIED], baseCfg(judge));
+    expect(r.reports[0].worth).toBe(true);
+    expect(r.reports[0].rescued).toBe(true);
+  });
+
+  test('fabricated segments never rescue; routine content_type never rescues', async () => {
+    const fake = makeFakeEngine();
+    seedVerdict(fake.rows, BURIED, {
+      score: 0.35, content_type: 'mixed',
+      segments: [{ quote: 'a passage that appears nowhere in this transcript at all, invented' }],
+    });
+    const r1 = await runTriagePass(fake.engine, [BURIED], baseCfg(null));
+    expect(r1.reports[0].worth).toBe(false);
+    expect(r1.reports[0].rescued).toBeUndefined();
+
+    seedVerdict(fake.rows, BURIED, { score: 0.35, content_type: 'routine', segments: SEGMENTS });
+    const r2 = await runTriagePass(fake.engine, [BURIED], baseCfg(null));
+    expect(r2.reports[0].worth).toBe(false);
+  });
+
+  test('kill switch (rescue.minSegments=0) restores the plain threshold gate', async () => {
+    const fake = makeFakeEngine();
+    seedVerdict(fake.rows, BURIED, { score: 0.35, content_type: 'mixed', segments: SEGMENTS });
+    const r = await runTriagePass(fake.engine, [BURIED], baseCfg(null, {
+      rescue: { floor: 0.30, minSegments: 0, contentTypes: ['mixed'] },
+    }));
+    expect(r.reports[0].worth).toBe(false);
+  });
+
+  test('F6 regression: a degenerate (unparseable) judge response still contributes tokens — the call was paid', async () => {
+    const { engine } = makeFakeEngine();
+    const t = makeTranscript('degenerate-paid');
+    const judge: JudgeClient = {
+      create: async () => ({
+        content: [{ type: 'text', text: 'not json at all' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1234, output_tokens: 56 },
+      } as never),
+    };
+    const r = await runTriagePass(engine, [t], baseCfg(judge));
+    expect(r.unreliable).toBe(1);
+    expect(r.tokens).toEqual({ in: 1234, out: 56 });
+  });
+
+  test('F6 regression: priceChatUsd is null for unpriced models, non-null rounded for priced (never a fake 0)', async () => {
+    const { __testing } = await import('../src/core/cycle/synthesize.ts');
+    expect(__testing.priceChatUsd('totally-unknown:model-x', { in: 1000, out: 1000 })).toBeNull();
+    const priced = __testing.priceChatUsd('anthropic:claude-haiku-4-5-20251001', { in: 1_000_000, out: 0 });
+    expect(priced).not.toBeNull();
+    expect(priced!).toBeGreaterThan(0);
+  });
+
+  test('buildTriageMapBlock: case/curly-punctuation drift in a judge quote still verifies (shared normalizer)', () => {
+    const chunk = 'The user said “We charge for durability, not storage” and moved on.';
+    const block = buildTriageMapBlock({
+      score: 0.8,
+      content_type: 'idea',
+      segments: [{ quote: 'we charge for durability, not storage' }],
+      entities: [],
+    } as never, chunk, 1);
+    expect(block).toContain('we charge for durability, not storage');
+  });
+
+  test('a rescued report is NOT below_threshold (the one-gate consistency the retriage sweep reads)', async () => {
+    const fake = makeFakeEngine();
+    seedVerdict(fake.rows, BURIED, { score: 0.35, content_type: 'mixed', segments: SEGMENTS });
+    const rejected = makeTranscript('rejected');
+    seedVerdict(fake.rows, rejected, { score: 0.35, content_type: 'mixed', segments: [] });
+    const r = await runTriagePass(fake.engine, [BURIED, rejected], baseCfg(null));
+    const belowThreshold = r.reports.filter(x => x.score !== null && !x.worth);
+    expect(belowThreshold.map(x => x.filePath)).toEqual([rejected.filePath]);
   });
 });
 
@@ -305,7 +423,11 @@ describe('runTriagePass — degrade + failure contracts', () => {
     const r = await runTriagePass(engine, [t], baseCfg(judge));
     expect(r.unreliable).toBe(1);
     expect(r.reports[0].unreliable).toBe('truncated');
-    expect(rows.size).toBe(0);
+    // #6069: the only row is the backoff marker; its NULL score is never a verdict.
+    const stored = [...rows.values()];
+    expect(stored).toHaveLength(1);
+    expect(stored[0].score).toBeNull();
+    expect(stored[0].content_type).toBe('triage_unreliable');
     expect(r.byPath.has(t.filePath)).toBe(false);
   });
 });

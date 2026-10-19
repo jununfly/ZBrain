@@ -14,6 +14,7 @@
  *  - cache hit path: skip already-graded (take, prompt, judge, evidence_sig)
  *  - takes that are too recent are skipped
  *  - judge throw on a single take logs warning + phase continues
+ *  - parse failure rejects instead of minting a cached 'unresolvable' (#3910)
  *  - parseJudgeOutput unit tests
  *  - takeIsOldEnough unit tests
  */
@@ -21,6 +22,7 @@
 import { describe, test, expect } from 'bun:test';
 import {
   runPhaseGradeTakes,
+  defaultJudge,
   parseJudgeOutput,
   evidenceSignature,
   takeIsOldEnough,
@@ -58,6 +60,7 @@ function buildMockEngine(opts: {
     },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
+      if (sql.includes('FROM persistence_brain')) return [{ enabled: false } as unknown as T]; // #6482: the strict mode reader needs one well-formed unmanaged row.
       if (sql.includes('SELECT verdict, confidence, applied FROM take_grade_cache')) {
         const [takeId, pv, model, sig] = params ?? [];
         const key = `${takeId}|${pv}|${model}|${sig}`;
@@ -68,6 +71,10 @@ function buildMockEngine(opts: {
     },
     async resolveTake(pageId: number, rowNum: number, resolution: TakeResolution): Promise<void> {
       resolves.push({ pageId, rowNum, resolution });
+    },
+    // The resolution runs in a maintenance transaction; the mock is its own transaction engine.
+    async transaction<T>(fn: (tx: BrainEngine) => Promise<T>): Promise<T> {
+      return fn(engine);
     },
   } as unknown as BrainEngine;
 
@@ -145,6 +152,24 @@ describe('parseJudgeOutput', () => {
   test('returns null on garbage input', () => {
     expect(parseJudgeOutput('not json at all')).toBeNull();
     expect(parseJudgeOutput('')).toBeNull();
+  });
+
+  // W6 dev round: Sonnet 5.5 answered twice in 9 of 118 calls (an object, then
+  // "Correction: here is the output in the required format." and a second
+  // object), and prose after the object also failed the parse, so the take was
+  // re-graded and re-billed every cycle and never got a verdict.
+  test('a corrected second answer that agrees parses, keeping the lower confidence', () => {
+    const raw = '{"verdict":"correct","confidence":0.85,"reasoning":"first","note":null}\n\nCorrection: here is the output in the required format.\n\n{"verdict":"correct","confidence":0.9,"reasoning":"second {braces} in a string"}';
+    expect(parseJudgeOutput(raw)).toEqual({ verdict: 'correct', confidence: 0.85, reasoning: 'second {braces} in a string' });
+  });
+
+  test('prose before and after the object parses', () => {
+    const raw = 'The later document is the more direct evidence.\n\n{"verdict":"incorrect","confidence":0.7,"reasoning":"missed \\"the target\\""}\n\nDone.';
+    expect(parseJudgeOutput(raw)).toEqual({ verdict: 'incorrect', confidence: 0.7, reasoning: 'missed "the target"' });
+  });
+
+  test('two answers that disagree are no verdict', () => {
+    expect(parseJudgeOutput('{"verdict":"correct","confidence":0.9,"reasoning":"a"} {"verdict":"incorrect","confidence":0.9,"reasoning":"b"}')).toBeNull();
   });
 
   test('truncates reasoning longer than 400 chars', () => {
@@ -419,6 +444,61 @@ describe('runPhaseGradeTakes — phase integration', () => {
     expect(details.verdicts_written).toBe(1);
     expect(result.status).toBe('warn'); // per-take warnings, but no halt
     expect(result.summary).not.toContain('aborted on');
+  });
+});
+
+// ─── #3910: judge parse failure must not mint a durable verdict ─────
+
+/** Hermetic gateway stand-in: returns fixed text through defaultJudge's chatFn seam. */
+function stubChatFn(text: string): NonNullable<Parameters<typeof defaultJudge>[1]> {
+  return async () => ({
+    text,
+    blocks: [],
+    stopReason: 'end',
+    usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    model: 'test:stub-judge',
+    providerId: 'stub',
+  });
+}
+
+describe('defaultJudge parse failure (#3910)', () => {
+  test('unparseable judge output rejects instead of resolving to a synthetic unresolvable verdict', async () => {
+    const take = buildTake({ id: 7, sinceDate: '2023-01-01' });
+    await expect(
+      defaultJudge({ take, evidence: 'evidence body' }, stubChatFn('sorry, cannot answer in JSON')),
+    ).rejects.toThrow(/parse/);
+  });
+
+  test('control: valid verdict JSON resolves to the parsed verdict', async () => {
+    const take = buildTake({ id: 8, sinceDate: '2023-01-01' });
+    const verdict = await defaultJudge(
+      { take, evidence: 'evidence body' },
+      stubChatFn('{"verdict":"correct","confidence":0.88,"reasoning":"evidence supports it"}'),
+    );
+    expect(verdict).toEqual({ verdict: 'correct', confidence: 0.88, reasoning: 'evidence supports it' });
+  });
+
+  test('phase: parse failure warns naming the take, writes NO cache row, and the take stays retryable', async () => {
+    const takes = [buildTake({ id: 42, sinceDate: '2023-01-01' })];
+    const { engine, captured, resolves } = buildMockEngine({ takes });
+    const garbageChat = stubChatFn('sorry, cannot answer in JSON');
+    const judge: JudgeFn = (input) => defaultJudge(input, garbageChat);
+
+    const result = await runPhaseGradeTakes(buildCtx(engine), { judge });
+
+    expect(result.status).toBe('warn'); // per-take warnings, but no halt
+    const details = result.details as Record<string, unknown>;
+    expect(details.verdicts_written).toBe(0);
+    // Pre-fix: one INSERT landed a {verdict:'unresolvable', confidence:0} row
+    // keyed on the deterministic placeholder evidence signature, so every
+    // later cycle cache-hit it and the take was silently frozen forever.
+    const inserts = captured.filter(c => c.sql.includes('INSERT INTO take_grade_cache'));
+    expect(inserts).toHaveLength(0);
+    const warnings = details.warnings as string[];
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('42');
+    expect(warnings[0]).toContain('parse');
+    expect(resolves).toHaveLength(0);
   });
 });
 

@@ -37,22 +37,29 @@
  *     response, and an old serve answers `unknown_kind:sync_start` so the
  *     client degrades to the documented stop-the-serve refusal.
  *
+ *   sweep_start / sweep_status (secret-gated, protocol:2) — #677:
+ *     serve-delegated maintenance sweep, the same start+poll shape as the
+ *     sync kinds (no abort — a sweep is a bounded run). Wire shapes in
+ *     sweep-ipc.ts; execution in serve-sweep-runner.ts; CLI half in
+ *     commands/sweep-delegate.ts.
+ *
  * Local-only (unix socket in a 0700 dir on the brain's data dir, socket mode
  * 0600 set before readiness is announced) — no network surface.
  */
 
 import net from 'node:net';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   existsSync,
   unlinkSync,
-  statSync,
   chmodSync,
   mkdirSync,
   readFileSync,
   writeFileSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { configDir } from '../config.ts';
+import { claimLocalIpcBinding, isWindowsIpcPipe, localIpcSocketPath, prepareLocalIpcPath, unixSocketProbeState } from './ipc-path.ts';
 import type { EntityCandidate } from './entity-salience.ts';
 import type { WindowTurn } from './entity-salience.ts';
 import type { PointerBlock } from './retrieval-reflex.ts';
@@ -65,6 +72,12 @@ import type {
   SyncStatusRequest,
   SyncStatusResponse,
 } from './sync-ipc.ts';
+import type {
+  SweepStartRequest,
+  SweepStartResponse,
+  SweepStatusRequest,
+  SweepStatusResponse,
+} from './sweep-ipc.ts';
 
 const SOCK_NAME = '.gbrain-resolve.sock';
 const SECRET_NAME = '.gbrain-ipc-secret';
@@ -95,6 +108,12 @@ export const CONTEXT_PACK_SERVER_BUDGET_MS = 600;
 export const SYNC_START_CLIENT_TIMEOUT_MS = 1500;
 export const SYNC_STATUS_CLIENT_TIMEOUT_MS = 1000;
 export const SYNC_ABORT_CLIENT_TIMEOUT_MS = 1000;
+/**
+ * Delegated-sweep kinds (#677) — same O(1) register/read shape as the sync
+ * kinds, same budgets.
+ */
+export const SWEEP_START_CLIENT_TIMEOUT_MS = 1500;
+export const SWEEP_STATUS_CLIENT_TIMEOUT_MS = 1000;
 const MAX_MSG_BYTES = 256 * 1024;
 
 /** Marker the client returns when no server is reachable (vs. a real null result). */
@@ -116,6 +135,13 @@ export interface ResolveRequest {
   sourceId?: string;
   /** v0.43 (#2095, codex D7): suppression mode — 'slug-only' under windowing. */
   suppression?: 'slug-and-title' | 'slug-only';
+  /**
+   * 2026-08 fix wave: the volunteer stage's wide ungated pool resolve. The
+   * binding's onDelivered skips delivery logging for probe requests (the pool
+   * is not injected pointers; gated survivors log via volunteer-events). An
+   * older serve ignores the field — accepted minor mixed-version stat noise.
+   */
+  probe?: 'volunteer';
   /**
    * v0.46.15: lexical-arms kill switch. Either side may disable: a client
    * `false` wins; otherwise the server applies its own file-config gate.
@@ -193,6 +219,19 @@ export interface ContextPackRequest {
    * OpenClaw assemble poll.
    */
   manifestOnly?: boolean;
+  /**
+   * Always-loaded core (additive, read-only): return only the core block for
+   * the session source — no assembly, no cursor advance, no banking. Used by
+   * the OpenClaw assemble lane. An older serve ignores it and assembles.
+   */
+  coreOnly?: boolean;
+  /**
+   * #5575 ENG-11 (additive, coreOnly companion): the trust cache identity of
+   * the client's memoized core block. When the serve's current identity
+   * matches, it answers `coreTrust.unchanged` without assembling. An older
+   * serve ignores it and returns the full block without an identity.
+   */
+  coreIdentity?: string;
 }
 
 export type IpcRequest =
@@ -201,7 +240,9 @@ export type IpcRequest =
   | ContextPackRequest
   | SyncStartRequest
   | SyncStatusRequest
-  | SyncAbortRequest;
+  | SyncAbortRequest
+  | SweepStartRequest
+  | SweepStatusRequest;
 
 export interface ResolveResponse {
   ok: boolean;
@@ -229,11 +270,17 @@ export interface ContextPackResponse {
 
 export type ResolveHandler = (req: ResolveRequest) => Promise<PointerBlock | null>;
 export type TurnContextHandler = (req: TurnContextRequest) => Promise<TurnContextResult | null>;
-export type ContextPackHandler = (req: ContextPackRequest) => Promise<TurnContextResult | null>;
+/**
+ * `progress.assembled` is set by a handler once its pack is assembled; the transport's backstop returns that pack
+ * (marked `server_budget`) instead of nothing when the handler's later work (core, session state, brief) runs past it.
+ */
+export type ContextPackHandler = (req: ContextPackRequest, progress?: { assembled?: TurnContextResult | null }) => Promise<TurnContextResult | null>;
 
 export type SyncStartIpcHandler = (req: SyncStartRequest) => SyncStartResponse | Promise<SyncStartResponse>;
 export type SyncStatusIpcHandler = (req: SyncStatusRequest) => SyncStatusResponse | Promise<SyncStatusResponse>;
 export type SyncAbortIpcHandler = (req: SyncAbortRequest) => SyncAbortResponse | Promise<SyncAbortResponse>;
+export type SweepStartIpcHandler = (req: SweepStartRequest) => SweepStartResponse | Promise<SweepStartResponse>;
+export type SweepStatusIpcHandler = (req: SweepStatusRequest) => SweepStatusResponse | Promise<SweepStatusResponse>;
 
 /** Handler MAP replacing the single closure [ENG-3]. */
 export interface IpcHandlers {
@@ -243,6 +290,8 @@ export interface IpcHandlers {
   sync_start?: SyncStartIpcHandler;
   sync_status?: SyncStatusIpcHandler;
   sync_abort?: SyncAbortIpcHandler;
+  sweep_start?: SweepStartIpcHandler;
+  sweep_status?: SweepStatusIpcHandler;
 }
 
 export interface IpcServerOpts {
@@ -265,6 +314,12 @@ export interface IpcServerOpts {
    */
   onTurnContextDelivered?: (result: TurnContextResult, req: TurnContextRequest) => void;
   /**
+   * context_pack sibling of onTurnContextDelivered (wave 5 D5): fired ONLY
+   * after an ok context_pack response with a non-empty block was written —
+   * the SessionStart brief's delivery seam (telemetry + repeat ledger).
+   */
+  onContextPackDelivered?: (result: TurnContextResult, req: ContextPackRequest) => void;
+  /**
    * The server's registered source [CX2-10]. turn_context requests naming a
    * DIFFERENT sourceId are rejected with 'source_mismatch'; the handler always
    * assembles against the bound source regardless.
@@ -280,7 +335,113 @@ export interface IpcServerOpts {
 
 /** Canonical socket path for a PGLite data dir. */
 export function resolveSocketPath(dataDir: string): string {
-  return join(dataDir, SOCK_NAME);
+  return localIpcSocketPath(join(dataDir, SOCK_NAME));
+}
+
+// -- Engine-uniform paths (#4245, TODOS "engine-uniform IPC listener") --
+
+/**
+ * IPC home for brains with no data dir: `~/.gbrain/run` (GBRAIN_HOME
+ * honored via configDir). Created 0700 by the server bind / secret
+ * provision paths — never world-visible.
+ */
+export function ipcRunDir(): string {
+  return join(configDir(), 'run');
+}
+
+/** First 12 hex chars of sha256(value) — path key that never embeds the URL's credentials. */
+function hash12(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 12);
+}
+
+/** Minimal config slice the engine-uniform path resolvers key on (loadConfig's shape). */
+export interface IpcPathConfig {
+  engine?: 'postgres' | 'pglite';
+  database_path?: string;
+  database_url?: string;
+}
+
+/**
+ * Canonical socket path for a brain CONFIG (engine-uniform, #4245).
+ * PGLite keeps the data-dir socket when it fits the Unix byte budget;
+ * longer paths use the shared private fallback. Postgres gets
+ * `~/.gbrain/run/resolve-<hash12(database_url)>.sock` so two brains on one
+ * machine never share a socket. Returns null when the config carries no
+ * keying material (no config at all, thin-client remote, or a postgres
+ * config with no URL) — callers degrade, never guess.
+ *
+ * Engine is checked FIRST: a postgres config carrying a LEFTOVER
+ * database_path must not key off the path — there is no PGLite brain (and
+ * no serve) behind it (v0.45.7 gate, preserved).
+ *
+ * Multi-serve note (#5042): on Postgres every serve binds the resolve
+ * socket of its own bound source (`sourceId` → `resolve-<hash12(url)>-
+ * <hash12(source)>.sock`), so serves for different sources of one database
+ * coexist. Without `sourceId` this returns the legacy URL-only path, which a
+ * serve also binds when it is free (first LIVE provider wins; a later serve
+ * defers instead of unlinking it, #4896). The persistence socket ignores
+ * `sourceId`: it routes to the single resident owner, so it stays
+ * brain-keyed. Bound-source rejection [CX2-10] still applies per request.
+ */
+export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined, kind: 'resolve' | 'persistence' = 'resolve', sourceId?: string): string | null {
+  if (!cfg) return null;
+  if (cfg.engine === 'pglite' && cfg.database_path) return localIpcSocketPath(join(cfg.database_path, `.gbrain-${kind}.sock`));
+  if (cfg.engine === 'postgres' && cfg.database_url) {
+    const sourceKey = kind === 'resolve' && sourceId ? `-${hash12(sourceId)}` : '';
+    return localIpcSocketPath(join(ipcRunDir(), `${kind}-${hash12(cfg.database_url)}${sourceKey}.sock`));
+  }
+  return null;
+}
+
+/**
+ * The resolve socket a hook calls (#5042): its own source's socket
+ * (`GBRAIN_SOURCE`, else `default`) when a serve listens there, else the
+ * legacy URL-only socket (an older serve, or a serve bound to a source the
+ * hook does not name). PGLite has a single path (one serve per data dir).
+ */
+export async function hookResolveSocketForConfig(cfg: IpcPathConfig | null | undefined, sourceId: string | undefined): Promise<string | null> {
+  const legacy = resolveSocketPathForConfig(cfg);
+  const keyed = resolveSocketPathForConfig(cfg, 'resolve', sourceId || 'default');
+  if (!legacy || !keyed || keyed === legacy) return legacy;
+  return (await socketHasLiveListener(keyed)) ? keyed : legacy;
+}
+
+/**
+ * Canonical shared-secret path for a brain config — same engine-uniform
+ * keying as resolveSocketPathForConfig (data dir on PGLite, hash12-keyed
+ * run-dir file on Postgres). Null = no keying material.
+ */
+export function ipcSecretPathForConfig(cfg: IpcPathConfig | null | undefined): string | null {
+  if (!cfg) return null;
+  if (cfg.engine === 'pglite' && cfg.database_path) return ipcSecretPath(cfg.database_path);
+  if (cfg.engine === 'postgres' && cfg.database_url) {
+    return join(ipcRunDir(), `secret-${hash12(cfg.database_url)}`);
+  }
+  return null;
+}
+
+/**
+ * Server-side (engine-uniform): ensure the secret at the config-keyed path.
+ * Null = no keying material (caller starts no listener); throws only when
+ * the file can neither be read nor created (turn_context disabled, never
+ * "skip auth" — same contract as ensureIpcSecret).
+ */
+export function ensureIpcSecretForConfig(cfg: IpcPathConfig | null | undefined): string | null {
+  const p = ipcSecretPathForConfig(cfg);
+  if (!p) return null;
+  return ensureIpcSecretAtPath(p);
+}
+
+/** Client-side (engine-uniform): read the config-keyed secret; null when absent. */
+export function readIpcSecretForConfig(cfg: IpcPathConfig | null | undefined): string | null {
+  const p = ipcSecretPathForConfig(cfg);
+  if (!p) return null;
+  try {
+    const s = readFileSync(p, 'utf8').trim();
+    return s || null;
+  } catch {
+    return null;
+  }
 }
 
 // ── Shared secret [S3#6] ──────────────────────────────────────────────────
@@ -297,7 +458,11 @@ export function ipcSecretPath(dataDir: string): string {
  * "turn_context disabled", never as "skip auth").
  */
 export function ensureIpcSecret(dataDir: string): string {
-  const p = ipcSecretPath(dataDir);
+  return ensureIpcSecretAtPath(ipcSecretPath(dataDir));
+}
+
+/** Path-keyed body shared by the data-dir and config-keyed secret provisioners. */
+function ensureIpcSecretAtPath(p: string): string {
   try {
     const existing = readFileSync(p, 'utf8').trim();
     if (existing) {
@@ -506,6 +671,32 @@ export async function requestSyncAbort(
   return syncRoundTrip<SyncAbortResponse>(socketPath, line, opts.timeoutMs ?? SYNC_ABORT_CLIENT_TIMEOUT_MS);
 }
 
+// ── Delegated-sweep clients (#677) — same fail-soft ladder as sync ─────────
+
+export type SweepStartClientRequest = Omit<SweepStartRequest, 'kind' | 'protocol'>;
+export type SweepStatusClientRequest = Omit<SweepStatusRequest, 'kind' | 'protocol'>;
+
+export type SweepStartIpcResult = SweepStartResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
+export type SweepStatusIpcResult = SweepStatusResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
+
+export async function requestSweepStart(
+  socketPath: string,
+  req: SweepStartClientRequest,
+  opts: { timeoutMs?: number } = {},
+): Promise<SweepStartIpcResult> {
+  const line = JSON.stringify({ kind: 'sweep_start', protocol: 2, ...req } satisfies SweepStartRequest);
+  return syncRoundTrip<SweepStartResponse>(socketPath, line, opts.timeoutMs ?? SWEEP_START_CLIENT_TIMEOUT_MS);
+}
+
+export async function requestSweepStatus(
+  socketPath: string,
+  req: SweepStatusClientRequest,
+  opts: { timeoutMs?: number } = {},
+): Promise<SweepStatusIpcResult> {
+  const line = JSON.stringify({ kind: 'sweep_status', protocol: 2, ...req } satisfies SweepStatusRequest);
+  return syncRoundTrip<SweepStatusResponse>(socketPath, line, opts.timeoutMs ?? SWEEP_STATUS_CLIENT_TIMEOUT_MS);
+}
+
 async function syncRoundTrip<Resp extends { ok: boolean; protocol: 2 }>(
   socketPath: string,
   line: string,
@@ -525,7 +716,22 @@ function roundTrip(
   requestLine: string,
   timeoutMs: number,
 ): Promise<unknown | typeof IPC_UNAVAILABLE> {
-  if (!existsSync(socketPath)) return Promise.resolve(IPC_UNAVAILABLE);
+  try { socketPath = prepareLocalIpcPath(socketPath); }
+  catch { return Promise.resolve(IPC_UNAVAILABLE); }
+  // POSIX fast-path only: a Unix domain socket is a real filesystem entry, so
+  // existsSync() lets the common "no server running" case skip a syscall.
+  // On win32, Bun binds a plain path as a real AF_UNIX socket (afunix.sys
+  // reparse-point file) that Bun's existsSync()/statSync() cannot see, so
+  // existsSync() is always false here even while a live server is listening
+  // and a real connection would succeed. Gating on it on Windows made every
+  // IPC call fail closed unconditionally (verified: a listen()+connect()
+  // round trip against the same plain path succeeds on Bun 1.3.14 / Windows
+  // 11, while existsSync() on that path returns false throughout). Skip the
+  // pre-check there and let the connection-level error/timeout handlers
+  // below do the real "no server" detection.
+  if (process.platform !== 'win32' && !existsSync(socketPath)) {
+    return Promise.resolve(IPC_UNAVAILABLE);
+  }
   return new Promise((resolve) => {
     let settled = false;
     let buf = '';
@@ -562,9 +768,12 @@ function roundTrip(
 // ── Server ────────────────────────────────────────────────────────────────
 
 /**
- * Server: start an IPC listener on `socketPath`. Cleans up a stale socket
- * left by a dead owner first, hardens the parent dir to 0700, and chmods the
- * socket 0600 BEFORE announcing readiness [S3#6]. Returns the net.Server
+ * Server: start an IPC listener on `socketPath`. Probes the path for an owner
+ * first — unless the connect is hard-refused (nothing listens), returns null
+ * and leaves the socket untouched: a serve that accepts, or one too busy to
+ * accept within the probe budget, is the IPC provider (#4896). Only a dead
+ * owner's leftover entry is cleaned up; then hardens the parent dir to 0700, and chmods
+ * the socket 0600 BEFORE announcing readiness [S3#6]. Returns the net.Server
  * (caller closes on shutdown). Errors are swallowed (best-effort feature) —
  * returns null if the socket can't be bound.
  *
@@ -595,16 +804,23 @@ export async function startResolveIpcServer(
       ? { onDelivered: onDeliveredOrOpts }
       : onDeliveredOrOpts ?? {};
 
-  // [S3#6] Parent dir 0700 (create if missing, tighten if present) so an
-  // unrelated local user can't even see the socket / secret names.
-  try {
-    const dir = dirname(socketPath);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    chmodSync(dir, 0o700);
-  } catch { /* best effort */ }
+  const binding = await claimLocalIpcBinding(socketPath).catch(() => null);
+  if (!binding) return null;
+  socketPath = binding.socketPath;
 
-  // Remove a stale socket file if present (a previous serve that didn't clean up).
-  cleanupStaleSocket(socketPath);
+  // Only a provably dead owner is displaced (#4896 — a transient serve used
+  // to unlink the long-lived one's socket and take the pathname with it on
+  // exit). 'live' AND 'unknown' (probe timed out: a serve whose event loop
+  // is busy) both defer — this serve runs without IPC rather than risk it.
+  // The native claim serializes this probe and stale cleanup with binding.
+  if ((await probeSocketOwner(socketPath)) !== 'dead') { await binding.release(); return null; }
+  // Bun 1.3.11 cannot stat a stale Windows AF_UNIX reparse point. The native
+  // binding verifies its exact tag and deletes through that same handle.
+  // A denied or unexpected leaf never authorizes stale cleanup.
+  if (binding.removeStaleWindowsSocket) {
+    try { binding.removeStaleWindowsSocket(); }
+    catch { await binding.release(); return null; }
+  } else if (!isWindowsIpcPipe(socketPath)) try { unlinkSync(socketPath); } catch { /* nothing stale, or not ours to remove */ }
 
   return new Promise((resolve) => {
     const server = net.createServer((conn) => {
@@ -627,6 +843,7 @@ export async function startResolveIpcServer(
         let resp: string;
         let delivered: { block: PointerBlock; req: ResolveRequest } | null = null;
         let deliveredTurnContext: { result: TurnContextResult; req: TurnContextRequest } | null = null;
+        let deliveredPack: { result: TurnContextResult; req: ContextPackRequest } | null = null;
         try {
           const parsed = JSON.parse(line) as IpcRequest;
           const kind = (parsed as { kind?: unknown }).kind ?? 'resolve';
@@ -655,9 +872,10 @@ export async function startResolveIpcServer(
               deliveredTurnContext = { result: tcResp.block, req };
             }
           } else if (kind === 'context_pack') {
-            resp = JSON.stringify(
-              await handleContextPack(parsed as ContextPackRequest, handlers, opts),
-            );
+            const req = parsed as ContextPackRequest;
+            const cpResp = await handleContextPack(req, handlers, opts);
+            resp = JSON.stringify(cpResp);
+            if (cpResp.ok && cpResp.block && cpResp.block.text) deliveredPack = { result: cpResp.block, req };
           } else if (kind === 'sync_start') {
             resp = JSON.stringify(
               await handleSyncKind(parsed as SyncStartRequest, handlers.sync_start, opts),
@@ -669,6 +887,14 @@ export async function startResolveIpcServer(
           } else if (kind === 'sync_abort') {
             resp = JSON.stringify(
               await handleSyncKind(parsed as SyncAbortRequest, handlers.sync_abort, opts),
+            );
+          } else if (kind === 'sweep_start') {
+            resp = JSON.stringify(
+              await handleSyncKind(parsed as SweepStartRequest, handlers.sweep_start, opts),
+            );
+          } else if (kind === 'sweep_status') {
+            resp = JSON.stringify(
+              await handleSyncKind(parsed as SweepStatusRequest, handlers.sweep_status, opts),
             );
           } else {
             resp = JSON.stringify({ ok: false, error: `unknown_kind:${String(kind)}` });
@@ -686,17 +912,31 @@ export async function startResolveIpcServer(
           if (deliveredTurnContext && opts.onTurnContextDelivered) {
             try { opts.onTurnContextDelivered(deliveredTurnContext.result, deliveredTurnContext.req); } catch { /* telemetry only */ }
           }
+          if (deliveredPack && opts.onContextPackDelivered) {
+            try { opts.onContextPackDelivered(deliveredPack.result, deliveredPack.req); } catch { /* telemetry only */ }
+          }
         } catch { /* client gone — do NOT log undelivered pointers */ }
         conn.end();
       });
       conn.on('error', () => { try { conn.destroy(); } catch { /* noop */ } });
     });
-    server.on('error', () => resolve(null));
-    server.listen(socketPath, () => {
-      // Mode set BEFORE readiness is announced (the resolve() below) [S3#6].
-      try { chmodSync(socketPath, 0o600); } catch { /* best effort */ }
-      resolve(server);
+    let listened = false;
+    server.once('close', () => { void binding.release(); });
+    server.on('error', (e: NodeJS.ErrnoException) => {
+      if (process.env.GBRAIN_DEBUG === '1') {
+        process.stderr.write(`[resolve-ipc] listen failed (${e.code ?? 'unknown'}) at ${socketPath}\n`);
+      }
+      if (server.listening) server.close();
+      else if (!listened) void binding.release();
+      resolve(null);
     });
+    try { server.listen(socketPath, () => {
+      listened = true;
+      // Mode set BEFORE readiness is announced (the resolve() below) [S3#6].
+      try { if (process.platform !== 'win32') chmodSync(socketPath, 0o600); }
+      catch { server.close(); resolve(null); return; }
+      resolve(server);
+    }); } catch { if (!listened) void binding.release(); resolve(null); }
   });
 }
 
@@ -770,9 +1010,10 @@ async function handleContextPack(
       const t = setTimeout(() => r('__budget__'), CONTEXT_PACK_SERVER_BUDGET_MS + 200);
       t.unref?.();
     });
-    const result = await Promise.race([handlers.context_pack(req), budget]);
+    const progress: { assembled?: TurnContextResult | null } = {};
+    const result = await Promise.race([handlers.context_pack(req, progress), budget]);
     if (result === '__budget__') {
-      return { ok: true, protocol: 2, block: null, degradedReason: 'server_budget' };
+      return { ok: true, protocol: 2, block: progress.assembled ?? null, degradedReason: 'server_budget' };
     }
     return {
       ok: true,
@@ -808,16 +1049,58 @@ async function handleSyncKind<Req extends { protocol: number; secret: string }, 
   }
 }
 
-/** Remove a socket file whose owning process is gone (or any leftover file). */
-export function cleanupStaleSocket(socketPath: string): void {
-  try {
-    if (existsSync(socketPath)) {
-      // A unix socket shows up as a socket file; unlink unconditionally — if a
-      // live server holds it, listen() below would fail and we return null.
-      const st = statSync(socketPath);
-      if (st.isSocket() || st.isFIFO() || st.isFile()) unlinkSync(socketPath);
-    }
-  } catch {
-    /* best effort */
-  }
+/**
+ * Is something listening at `socketPath`? The same owner probe the pre-bind
+ * check uses: a leftover socket FILE (dead owner) is not a live provider, so
+ * callers must use this rather than existsSync() to decide "a serve is
+ * here". 'unknown' (probe timed out) counts as live — the conservative
+ * reading, identical to the bind path's "never displace on a timeout".
+ */
+export async function socketHasLiveListener(socketPath: string): Promise<boolean> {
+  try { socketPath = prepareLocalIpcPath(socketPath, false, true); }
+  catch { return true; } // Unsafe or inaccessible paths never authorize takeover.
+  return (await probeSocketOwner(socketPath)) !== 'dead';
+}
+
+/**
+ * Who owns `socketPath`? 'live' — something accepted the connect (a serve).
+ * 'dead' — the connect was hard-refused (ENOENT / ECONNREFUSED / ENOTSOCK:
+ * nothing listens; the entry is a dead owner's leftover the caller may
+ * remove). 'unknown' — the CLIENT_TIMEOUT_MS budget lapsed with the connect
+ * neither accepted nor refused (a live serve too busy to accept). The caller must
+ * never clean up on 'unknown': a timeout read as "dead" let a transient
+ * serve displace a long-lived one, the very #4896 symptom. The server side
+ * tolerates the data-less probe: one-request-per-connection means a
+ * connection that closes before its first line is just destroyed.
+ */
+type SocketOwner = 'live' | 'dead' | 'unknown';
+function probeSocketOwner(socketPath: string): Promise<SocketOwner> {
+  const unix = process.platform !== 'win32';
+  if (unix && unixSocketProbeState(socketPath) === 'unknown') return Promise.resolve('unknown');
+  return new Promise((resolve) => {
+    let settled = false;
+    const probe = new net.Socket();
+    const finish = (owner: SocketOwner) => {
+      if (settled) return;
+      settled = true;
+      try { probe.destroy(); } catch { /* noop */ }
+      resolve(owner);
+    };
+    // Listeners BEFORE connect(): under `bun test` Bun can emit the ENOENT
+    // for an absent path synchronously inside connect(), which would be an
+    // unhandled 'error' if attached afterwards.
+    probe.once('connect', () => finish('live'));
+    const failed = (error: unknown) => {
+      const code = (error as NodeJS.ErrnoException).code ?? '';
+      const entry = unix ? unixSocketProbeState(socketPath) : undefined;
+      // Bun can report ENOENT for an existing socket denied by permissions.
+      // Recheck after connect as permissions may have changed during the probe.
+      if (entry === 'unknown') { finish('unknown'); return; }
+      finish(['ENOENT', 'ECONNREFUSED', 'ENOTSOCK'].includes(code) ? 'dead' : 'unknown');
+    };
+    probe.once('error', failed);
+    probe.once('timeout', () => finish('unknown'));
+    probe.setTimeout(CLIENT_TIMEOUT_MS);
+    try { probe.connect(socketPath); } catch (error) { failed(error); }
+  });
 }

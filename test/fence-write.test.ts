@@ -22,8 +22,11 @@ import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { writeFactsToFence, lookupSourceLocalPath } from '../src/core/facts/fence-write.ts';
 import type { FenceInputFact } from '../src/core/facts/fence-write.ts';
-import { writeSingleFact } from '../src/core/facts/write-single.ts';
+import { forgetFactInFence } from '../src/core/facts/forget.ts';
+import { readRecentStubGuardEvents } from '../src/core/facts/stub-guard-audit.ts';
+import { writeSingleFact, isNullLikeEntity } from '../src/core/facts/write-single.ts';
 import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
+import { importFromContent } from '../src/core/import-file.ts';
 import { resetGateway } from '../src/core/ai/gateway.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -41,6 +44,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  await engine.executeRaw('DELETE FROM fact_withdrawals');
   // Fresh tempdir per test so the fence-write FS state is hermetic.
   brainDir = mkdtempSync(join(tmpdir(), 'fence-write-test-'));
   _resetWriteThroughCacheForTest();
@@ -102,7 +106,7 @@ describe('writeFactsToFence — happy path', () => {
   test('stub-creates entity page when none exists, writes fence, stamps DB', async () => {
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/alice' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/alice', resolutionSource: 'exact_page' },
       [baseInput()],
     );
 
@@ -133,6 +137,27 @@ describe('writeFactsToFence — happy path', () => {
     });
   });
 
+  // #4322 regression. stubEntityPage used to pick the type from a hardcoded
+  // people/companies/deals/topics ternary, so a stub under ANY other declared
+  // prefix silently became `concept`. `projects/` is in the gbrain-base prefix
+  // table (→ `project`) but was absent from that ternary, so it is the minimal
+  // case that fails on the old code and passes on the pack-aware one. No custom
+  // pack needed: with no pack configured the loader returns null and
+  // inferTypeFromPack falls back to GBRAIN_BASE_PATH_PREFIXES.
+  test('types a stub from the prefix table, not a hardcoded 4-entry list', async () => {
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'projects/apollo', resolutionSource: 'exact_page' },
+      [baseInput({ fact: 'Apollo shipped in 2017' })],
+    );
+
+    expect(result.inserted).toBe(1);
+    const body = readFileSync(join(brainDir, 'projects/apollo.md'), 'utf-8');
+    expect(body).toContain('type: project');
+    expect(body).not.toContain('type: concept');
+    expect(body).toContain('slug: projects/apollo');
+  });
+
   test('appends to existing entity page without overwriting body', async () => {
     // Pre-create the entity page with custom content.
     const filePath = join(brainDir, 'people/bob.md');
@@ -145,7 +170,7 @@ describe('writeFactsToFence — happy path', () => {
 
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/bob' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/bob', resolutionSource: 'exact_page' },
       [baseInput({ fact: 'Founded Widgets Inc.' })],
     );
 
@@ -158,10 +183,38 @@ describe('writeFactsToFence — happy path', () => {
     expect(body).toContain('Founded Widgets Inc.');
   });
 
+  test('#4872 mirrors the rewritten file into pages.compiled_truth; the next sync re-chunks the new row', async () => {
+    const filePath = join(brainDir, 'people/bob.md');
+    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    const file = '---\ntype: person\ntitle: Bob\nslug: people/bob\n---\n\n# Bob\n\nMet at YC W22.\n';
+    writeFileSync(filePath, file, 'utf-8');
+    expect((await importFromContent(engine, 'people/bob', file, { noEmbed: true, sourceId: 'default' })).status).toBe('imported');
+
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/bob', resolutionSource: 'exact_page' },
+      [baseInput({ fact: 'Founded Widgets Inc.' })],
+    );
+    expect(result.inserted).toBe(1);
+
+    // The DB body get_page / the reconcile read must carry the row remember
+    // just reported stored — otherwise a get→put round-trip flattens it away.
+    const page = await engine.getPage('people/bob', { sourceId: 'default' });
+    expect(page!.compiled_truth).toContain('Founded Widgets Inc.');
+    expect(page!.compiled_truth).toContain('Met at YC W22.');
+    // The mirror is body-only (content_chunks untouched), so it must NOT
+    // claim the importer's hash: the next sync has to see the file as changed
+    // and re-chunk, or search never indexes the remembered row (wave review).
+    const imp = await importFromContent(engine, 'people/bob', readFileSync(filePath, 'utf-8'), { noEmbed: true, sourceId: 'default' });
+    expect(imp.status).toBe('imported');
+    const chunks = await engine.getChunks('people/bob', { sourceId: 'default', requireSafeChunks: true });
+    expect(chunks.map((c) => c.chunk_text).join('\n')).toContain('Founded Widgets Inc.');
+  });
+
   test('multi-fact batch appends consecutive row_nums', async () => {
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/carol' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/carol', resolutionSource: 'exact_page' },
       [
         baseInput({ fact: 'Claim 1' }),
         baseInput({ fact: 'Claim 2' }),
@@ -184,14 +237,14 @@ describe('writeFactsToFence — happy path', () => {
     // First write seeds the fence with rows 1 and 2.
     await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/dan' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/dan', resolutionSource: 'exact_page' },
       [baseInput({ fact: 'First' }), baseInput({ fact: 'Second' })],
     );
 
     // Second write should pick up at row_num=3.
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/dan' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/dan', resolutionSource: 'exact_page' },
       [baseInput({ fact: 'Third' })],
     );
 
@@ -206,7 +259,7 @@ describe('writeFactsToFence — happy path', () => {
   test('stub-creates nested directories (companies/x → mkdir companies)', async () => {
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'companies/acme' },
+      { sourceId: 'default', localPath: brainDir, slug: 'companies/acme', resolutionSource: 'exact_page' },
       [baseInput({ fact: 'Founded 2017' })],
     );
 
@@ -223,7 +276,7 @@ describe('writeFactsToFence — happy path', () => {
 
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/durable' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/durable', resolutionSource: 'exact_page' },
       [baseInput({ fact: 'Durable fence fact' })],
     );
 
@@ -235,11 +288,54 @@ describe('writeFactsToFence — happy path', () => {
   }, 60_000);
 });
 
+describe('writeFactsToFence — withdrawn claims (write-path audit B-10)', () => {
+  test('never appends a withdrawn claim, or a punctuation variant of it, as an active Markdown row', async () => {
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+      VALUES ('default','world','people/alice',gbrain_fact_fingerprint('Founded Acme in 2017'))`);
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/alice', resolutionSource: 'exact_page' },
+      [baseInput(), baseInput({ fact: 'founded Acme, in 2017.' }), baseInput({ fact: 'Moved to Lisbon in 2020' })],
+    );
+    expect(result.withdrawnSkipped).toBe(2);
+    expect(result.inserted).toBe(1);
+    const body = readFileSync(join(brainDir, 'people/alice.md'), 'utf-8');
+    expect(body).not.toContain('Acme');
+    expect(body).toContain('Moved to Lisbon in 2020');
+    expect(await engine.executeRaw(`SELECT fact FROM facts WHERE entity_slug='people/alice' ORDER BY id`))
+      .toEqual([{ fact: 'Moved to Lisbon in 2020' }]);
+  });
+
+  test('a claim withdrawn for another entity is still written for this one', async () => {
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+      VALUES ('default','world','people/bob',gbrain_fact_fingerprint('Founded Acme in 2017'))`);
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/alice', resolutionSource: 'exact_page' },
+      [baseInput()],
+    );
+    expect(result).toMatchObject({ inserted: 1 });
+    expect(result.withdrawnSkipped).toBeUndefined();
+  });
+
+  test('an entirely withdrawn batch leaves the filesystem untouched', async () => {
+    await engine.executeRaw(`INSERT INTO fact_withdrawals(source_id,visibility,subject,fact_hash)
+      VALUES ('default','world','*',gbrain_fact_fingerprint('Founded Acme in 2017'))`);
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/carol', resolutionSource: 'exact_page' },
+      [baseInput()],
+    );
+    expect(result).toEqual({ inserted: 0, ids: [], withdrawnSkipped: 1 });
+    expect(existsSync(join(brainDir, 'people/carol.md'))).toBe(false);
+  });
+});
+
 describe('writeFactsToFence — legacy fallback', () => {
   test('null localPath returns legacyFallback:true with no inserts', async () => {
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: null, slug: 'people/whoever' },
+      { sourceId: 'default', localPath: null, slug: 'people/whoever', resolutionSource: 'exact_page' },
       [baseInput()],
     );
 
@@ -255,7 +351,7 @@ describe('writeFactsToFence — legacy fallback', () => {
     const slug = 'people/should-not-exist';
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug },
+      { sourceId: 'default', localPath: brainDir, slug, resolutionSource: 'exact_page' },
       [],
     );
     expect(result).toEqual({ inserted: 0, ids: [] });
@@ -269,7 +365,7 @@ describe('writeFactsToFence — atomic recovery', () => {
   test('after a successful write, no .tmp file is left behind', async () => {
     await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/erin' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/erin', resolutionSource: 'exact_page' },
       [baseInput()],
     );
 
@@ -279,10 +375,13 @@ describe('writeFactsToFence — atomic recovery', () => {
 });
 
 describe('writeFactsToFence — stub guard (v0.34.5)', () => {
-  test('refuses to stub-create an unprefixed entity page (bare slug)', async () => {
+  test('refuses to stub-create an unprefixed entity page (bare slug), even with exact_page provenance', async () => {
+    // #4108: the guard is a UNION — the unprefixed-slug arm keeps blocking
+    // regardless of resolution provenance, it wasn't replaced by the
+    // provenance arm.
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'alice' },
+      { sourceId: 'default', localPath: brainDir, slug: 'alice', resolutionSource: 'exact_page' },
       [baseInput()],
     );
 
@@ -300,10 +399,11 @@ describe('writeFactsToFence — stub guard (v0.34.5)', () => {
   test('prefixed slugs (people/, companies/, etc.) bypass the guard', async () => {
     // Sanity: re-prove the happy path right next to the guard test so a
     // future refactor that breaks the guard's slug.includes('/') check
-    // can't silently pass by only running the guard case.
+    // can't silently pass by only running the guard case. #4108: passes
+    // 'exact_page' — resolved-to-existing entities still fence.
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/zelda' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/zelda', resolutionSource: 'exact_page' },
       [baseInput({ fact: 'Founded Hyrule Labs in 2024' })],
     );
 
@@ -317,7 +417,7 @@ describe('writeFactsToFence — stub guard (v0.34.5)', () => {
     // guard only fires when there's actual work the caller wants to do.
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'alice' },
+      { sourceId: 'default', localPath: brainDir, slug: 'alice', resolutionSource: 'fallback_slugify' },
       [],
     );
 
@@ -325,6 +425,123 @@ describe('writeFactsToFence — stub guard (v0.34.5)', () => {
     expect(result.stubGuardBlocked).toBeUndefined();
     expect(result.legacyFallback).toBeUndefined();
     expect(existsSync(join(brainDir, 'alice.md'))).toBe(false);
+  });
+});
+
+describe('writeFactsToFence — v0.46 (#3014) supersession-warning seam', () => {
+  test('forwards an unresolvable `superseded by #N` warning to console.warn', async () => {
+    // The reachable shape through this path: writeFactsToFence appends
+    // active rows, but `context` is caller-controlled free text, so a
+    // "superseded by #N" context re-parses to supersededBy=N. When #N names
+    // no row, insertFacts resolves it to NULL + a warning; this test pins
+    // that writeFactsToFence forwards that warning to console.warn (the
+    // no-swallowed-errors seam) rather than dropping it.
+    const captured: string[] = [];
+    const original = console.warn;
+    // eslint-disable-next-line no-console
+    console.warn = (msg?: unknown) => { captured.push(String(msg)); };
+    let result;
+    try {
+      result = await writeFactsToFence(
+        engine,
+        { sourceId: 'default', localPath: brainDir, slug: 'people/alice', resolutionSource: 'exact_page' },
+        [baseInput({ fact: 'Points at a row that is not there', context: 'superseded by #99' })],
+      );
+    } finally {
+      // eslint-disable-next-line no-console
+      console.warn = original;
+    }
+
+    // The row still lands (the bad reference doesn't block the insert).
+    expect(result.inserted).toBe(1);
+    // The warning was logged with the category tag, not swallowed.
+    expect(captured.some(w => w.includes('[facts.supersession]') && w.includes('absent from the fence'))).toBe(true);
+  });
+});
+
+describe('writeFactsToFence — fallback-resolution stub guard (#4108)', () => {
+  test('prefixed slug with fallback_slugify provenance is blocked: no page, no DB rows', async () => {
+    const auditDir = mkdtempSync(join(tmpdir(), 'stub-guard-audit-4108-'));
+    try {
+      await withEnv({ GBRAIN_AUDIT_DIR: auditDir }, async () => {
+        const result = await writeFactsToFence(
+          engine,
+          { sourceId: 'default', localPath: brainDir, slug: 'companies/zeta-nonexistent', resolutionSource: 'fallback_slugify' },
+          [baseInput()],
+        );
+
+        expect(result.inserted).toBe(0);
+        expect(result.ids).toHaveLength(0);
+        expect(result.stubGuardBlocked).toBe(true);
+
+        // No canonical stub page materialized for the invented slug.
+        expect(existsSync(join(brainDir, 'companies/zeta-nonexistent.md'))).toBe(false);
+        expect(existsSync(join(brainDir, 'companies/zeta-nonexistent.md.tmp'))).toBe(false);
+
+        // No DB rows either — the CALLER routes to the legacy DB-only path.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const rows = await (engine as any).db.query('SELECT COUNT(*) AS n FROM facts');
+        expect(Number(rows.rows[0].n)).toBe(0);
+
+        // The audit event carries the new reason so stub_guard_24h can count
+        // fallback blocks separately from unprefixed ones.
+        const events = readRecentStubGuardEvents({ sinceMs: 60_000 });
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({
+          slug: 'companies/zeta-nonexistent',
+          reason: 'fallback_resolution',
+        });
+      });
+    } finally {
+      rmSync(auditDir, { recursive: true, force: true });
+    }
+  });
+
+  test('null provenance is blocked too (fail-closed when the caller has no resolution step)', async () => {
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'companies/zeta-nullprov', resolutionSource: null },
+      [baseInput()],
+    );
+
+    expect(result.stubGuardBlocked).toBe(true);
+    expect(existsSync(join(brainDir, 'companies/zeta-nullprov.md'))).toBe(false);
+  });
+
+  test('fallback provenance still APPENDS when the page file already exists on disk (DB/file drift edge)', async () => {
+    // The guard lives on the stub-CREATE branch only: a file that exists on
+    // disk but hasn't reached the pages index yet keeps accepting appends.
+    const slug = 'companies/zeta-ondisk';
+    mkdirSync(join(brainDir, 'companies'), { recursive: true });
+    writeFileSync(
+      join(brainDir, `${slug}.md`),
+      `---\ntype: company\ntitle: Zeta Ondisk\nslug: ${slug}\n---\n\n# Zeta Ondisk\n`,
+      'utf-8',
+    );
+
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug, resolutionSource: 'fallback_slugify' },
+      [baseInput({ fact: 'Still accepts drift appends' })],
+    );
+
+    expect(result.inserted).toBe(1);
+    expect(result.stubGuardBlocked).toBeUndefined();
+    expect(readFileSync(join(brainDir, `${slug}.md`), 'utf-8')).toContain('Still accepts drift appends');
+  });
+
+  test('alias_exact provenance passes the guard (curated alias hits may stub-create)', async () => {
+    // #4108 blocklist shape: only fallback_slugify/null are blocked, so the
+    // v0.46.15 alias_exact member fences like exact_page/fuzzy_match.
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: brainDir, slug: 'people/star-example', resolutionSource: 'alias_exact' },
+      [baseInput()],
+    );
+
+    expect(result.inserted).toBe(1);
+    expect(result.stubGuardBlocked).toBeUndefined();
+    expect(existsSync(join(brainDir, 'people/star-example.md'))).toBe(true);
   });
 });
 
@@ -361,7 +578,7 @@ describe('writeFactsToFence — row_num survives a fence-less rewrite', () => {
 
     const first = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug },
+      { sourceId: 'default', localPath: brainDir, slug, resolutionSource: 'exact_page' },
       [baseInput({ fact: 'First fact' }), baseInput({ fact: 'Second fact' })],
     );
     expect(first.inserted).toBe(2);
@@ -379,7 +596,7 @@ describe('writeFactsToFence — row_num survives a fence-less rewrite', () => {
     // existing rows on idx_facts_fence_key.
     const second = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug },
+      { sourceId: 'default', localPath: brainDir, slug, resolutionSource: 'exact_page' },
       [baseInput({ fact: 'Third fact' })],
     );
     expect(second.inserted).toBe(1);
@@ -402,15 +619,16 @@ describe('writeFactsToFence — row_num survives a fence-less rewrite', () => {
     // fence writes impossible (pre-v51 brains, transient DB errors).
     const brokenEngine = Object.create(engine) as typeof engine;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (brokenEngine as any).executeRaw = async (sqlText: string, params: unknown[]) => {
+    // A transaction engine derived from brokenEngine keeps its own connection: delegate with `this`.
+    (brokenEngine as any).executeRaw = async function (this: typeof engine, sqlText: string, params: unknown[]) {
       if (sqlText.includes('MAX(row_num)')) throw new Error('simulated lookup failure');
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (engine as any).executeRaw(sqlText, params);
+      return (engine as any).executeRaw.call(this, sqlText, params);
     };
 
     const result = await writeFactsToFence(
       brokenEngine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/dave' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/dave', resolutionSource: 'exact_page' },
       [baseInput({ fact: 'Written despite the failed hint' })],
     );
     expect(result.inserted).toBe(1);
@@ -425,7 +643,7 @@ describe('writeFactsToFence — sync.write_through opt-out', () => {
 
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/alice-example' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/alice-example', resolutionSource: 'exact_page' },
       [baseInput()],
     );
 
@@ -449,7 +667,7 @@ describe('writeFactsToFence — sync.write_through opt-out', () => {
 
     const result = await writeFactsToFence(
       engine,
-      { sourceId: 'default', localPath: brainDir, slug: 'people/db-only' },
+      { sourceId: 'default', localPath: brainDir, slug: 'people/db-only', resolutionSource: 'exact_page' },
       [baseInput()],
     );
 
@@ -472,16 +690,67 @@ describe('writeFactsToFence — sync.write_through opt-out', () => {
     });
 
     expect(r.status).toBe('inserted');
-    expect(r.entity_slug).toBe('people/frank-example');
+    // #5504: people/frank-example has no page, so the resolver fell back to
+    // slugification and the row carries no entity (the backstop convention).
+    expect(r.entity_slug).toBeNull();
     expect(existsSync(join(brainDir, 'people/frank-example.md'))).toBe(false);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rows = await (engine as any).db.query(
       'SELECT entity_slug, source_markdown_slug FROM facts WHERE id = $1',
       [r.id],
     );
-    expect(rows.rows[0].entity_slug).toBe('people/frank-example');
+    expect(rows.rows[0].entity_slug).toBeNull();
     // No .md backs the row — the fence-tracking column stays null.
     expect(rows.rows[0].source_markdown_slug).toBeNull();
+  });
+});
+
+describe('writeSingleFact — null-like entity tokens (#4755)', () => {
+  // LLM extractors emit the literal STRING "null" (or "None", "N/A", …) for
+  // subjectless statements. Pre-fix that token passed the non-empty check,
+  // failed resolution, fell back to itself as the slug, and the facts landed
+  // unreachable under entity_slug='null' (stub guard fired, no page rendered
+  // them, no entity lookup could reach them).
+  test('entity "null" is treated as absent: entity_slug null, no phantom slug', async () => {
+    resetGateway(); // no embedder → degraded dedup, no network
+    const r = await writeSingleFact(engine, 'default', {
+      fact: 'some statement with no subject',
+      provenance: 'test',
+      entity: 'null',
+    });
+    expect(r.status).toBe('inserted');
+    expect(r.entity_slug).toBeNull();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      'SELECT entity_slug FROM facts WHERE id = $1',
+      [r.id],
+    );
+    expect(rows.rows[0].entity_slug).toBeNull();
+    // No phantom page/tmp for the token either.
+    expect(existsSync(join(brainDir, 'null.md'))).toBe(false);
+    expect(existsSync(join(brainDir, 'null.md.tmp'))).toBe(false);
+  });
+
+  test('entity "None" (any casing) is treated as absent too', async () => {
+    resetGateway();
+    const r = await writeSingleFact(engine, 'default', {
+      fact: 'another subjectless statement',
+      provenance: 'test',
+      entity: 'None',
+    });
+    expect(r.status).toBe('inserted');
+    expect(r.entity_slug).toBeNull();
+  });
+
+  test('isNullLikeEntity: null-like tokens in any casing; real names pass', () => {
+    for (const t of ['null', 'NULL', 'Null', 'undefined', 'none', 'N/A', 'n/a', 'nil', '-', '', '  ', ' null ']) {
+      expect(isNullLikeEntity(t)).toBe(true);
+    }
+    expect(isNullLikeEntity(null)).toBe(true);
+    expect(isNullLikeEntity(undefined)).toBe(true);
+    for (const t of ['people/alice-example', 'Nullsoft', 'Noneck Labs', 'a-founder']) {
+      expect(isNullLikeEntity(t)).toBe(false);
+    }
   });
 });
 
@@ -499,7 +768,7 @@ describe('writeFactsToFence — durability latch recovery', () => {
         writeFileSync(indexLock, '');
         const first = await writeFactsToFence(
           engine,
-          { sourceId: 'default', localPath: brainDir, slug: 'people/latch' },
+          { sourceId: 'default', localPath: brainDir, slug: 'people/latch', resolutionSource: 'exact_page' },
           [baseInput({ fact: 'First latch fact' })],
         );
         expect(first.inserted).toBe(1);
@@ -509,7 +778,7 @@ describe('writeFactsToFence — durability latch recovery', () => {
 
         const second = await writeFactsToFence(
           engine,
-          { sourceId: 'default', localPath: brainDir, slug: 'people/latch' },
+          { sourceId: 'default', localPath: brainDir, slug: 'people/latch', resolutionSource: 'exact_page' },
           [baseInput({ fact: 'Second latch fact' })],
         );
         expect(second.inserted).toBe(1);
@@ -535,8 +804,8 @@ describe('writeFactsToFence — durability latch recovery', () => {
         installFakeDurabilityHook(brainDir);
         const filePath = join(brainDir, 'people/race.md');
 
-        // Gate writer A between its rename and its commit (insertFacts sits
-        // between the two), so writer B arrives while A's content is renamed
+        // Gate writer A after its publishing transaction and before its git commit,
+        // so writer B arrives while A's content is renamed
         // into place but not yet committed — the false preexisting_dirty
         // shape from the out-of-lock prewrite snapshot.
         let release: () => void = () => {};
@@ -544,15 +813,16 @@ describe('writeFactsToFence — durability latch recovery', () => {
         let gated = false;
         const gatedEngine = Object.create(engine) as typeof engine;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (gatedEngine as any).insertFacts = async (rows: unknown, opts: unknown) => {
-          if (!gated) { gated = true; await gate; }
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          return (engine as any).insertFacts(rows, opts);
+        // The transaction engine is derived from gatedEngine: delegate with `this`.
+        (gatedEngine as any).transaction = async function (this: typeof engine, fn: Parameters<typeof engine.transaction>[0]) {
+          const result = await engine.transaction.call(this, fn);
+          if (!gated && existsSync(filePath) && readFileSync(filePath, 'utf-8').includes('Writer A fact')) { gated = true; await gate; }
+          return result;
         };
 
         const a = writeFactsToFence(
           gatedEngine,
-          { sourceId: 'default', localPath: brainDir, slug: 'people/race' },
+          { sourceId: 'default', localPath: brainDir, slug: 'people/race', resolutionSource: 'exact_page' },
           [baseInput({ fact: 'Writer A fact' })],
         );
         // Wait until A's rename landed (post-rename, pre-commit).
@@ -564,7 +834,7 @@ describe('writeFactsToFence — durability latch recovery', () => {
 
         const b = writeFactsToFence(
           engine,
-          { sourceId: 'default', localPath: brainDir, slug: 'people/race' },
+          { sourceId: 'default', localPath: brainDir, slug: 'people/race', resolutionSource: 'exact_page' },
           [baseInput({ fact: 'Writer B fact' })],
         );
         // Give B a beat to start (pre-fix, its snapshot fired here, before
@@ -590,6 +860,108 @@ describe('writeFactsToFence — durability latch recovery', () => {
   }, 60_000);
 });
 
+describe('writeFactsToFence — path matches writePageThrough (#4204)', () => {
+  test('non-default source with its own local_path fences at the tree ROOT, not .sources/<id>/', async () => {
+    const projDir = mkdtempSync(join(tmpdir(), 'fence-write-proj-'));
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(
+        `INSERT INTO sources (id, name, local_path) VALUES ('proj', 'proj-test', $1)
+         ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
+        [projDir],
+      );
+
+      const result = await writeFactsToFence(
+        engine,
+        { sourceId: 'proj', localPath: projDir, slug: 'people/alice', resolutionSource: 'exact_page' },
+        [baseInput()],
+      );
+
+      expect(result.inserted).toBe(1);
+      // writePageThrough (#2018) writes a source that has its OWN local_path at
+      // that tree's root, never nested under `.sources/` — and sync's walker
+      // skips dot-directories, so a `.sources/` fence would be invisible to
+      // sync and its DB rows wiped by the next extract_facts reconcile.
+      expect(existsSync(join(projDir, 'people/alice.md'))).toBe(true);
+      expect(existsSync(join(projDir, '.sources/proj/people/alice.md'))).toBe(false);
+    } finally {
+      rmSync(projDir, { recursive: true, force: true });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(`DELETE FROM facts WHERE source_id = 'proj'`);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(`DELETE FROM pages WHERE source_id = 'proj'`);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(`DELETE FROM sources WHERE id = 'proj'`);
+    }
+  });
+
+  test("fence appends into the page's recorded source_path file, not a slug-derived twin", async () => {
+    try {
+      // A human-authored vault file whose on-disk name is not the slug.
+      const recordedRel = 'People/Alice Smith.md';
+      const recordedAbs = join(brainDir, recordedRel);
+      mkdirSync(join(brainDir, 'People'), { recursive: true });
+      writeFileSync(
+        recordedAbs,
+        '---\ntype: person\ntitle: Alice Smith\nslug: people/alice-smith\n---\n\n# Alice Smith\n',
+        'utf-8',
+      );
+      await engine.putPage('people/alice-smith', {
+        type: 'person',
+        title: 'Alice Smith',
+        compiled_truth: '# Alice Smith',
+        source_path: recordedRel,
+      }, { sourceId: 'default' });
+
+      const result = await writeFactsToFence(
+        engine,
+        { sourceId: 'default', localPath: brainDir, slug: 'people/alice-smith', resolutionSource: 'exact_page' },
+        [baseInput()],
+      );
+
+      expect(result.inserted).toBe(1);
+      // The fence must land in the file of record (same preference
+      // writePageThrough applies), or sync round-trips two divergent files.
+      expect(readFileSync(recordedAbs, 'utf-8')).toContain('Founded Acme in 2017');
+      expect(existsSync(join(brainDir, 'people/alice-smith.md'))).toBe(false);
+
+      // Round-trip: forget must find the fence in the SAME file the write
+      // targeted, or it degrades to a DB-only expire and leaves a live fence
+      // row for the next absorb to resurrect.
+      const forgot = await forgetFactInFence(engine, result.ids[0], { reason: 'test' });
+      expect(forgot.ok).toBe(true);
+      expect(forgot.path).toBe('fence');
+      expect(readFileSync(recordedAbs, 'utf-8')).toContain('~~');
+    } finally {
+      // The engine is shared across the file; drop the page row so its
+      // recorded source_path (relative to this test's dead tempdir) can't
+      // leak into later tests.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(`DELETE FROM pages WHERE slug = 'people/alice-smith' AND source_id = 'default'`);
+    }
+  });
+
+  test('unusable source tree returns targetUnresolvable so callers route to DB-only, not drop', async () => {
+    // Point the source at a directory that no longer exists — the resolver
+    // must refuse (same repo_not_found refusal as writePageThrough) instead
+    // of blindly resurrecting the deleted tree with mkdir -p.
+    const goneDir = mkdtempSync(join(tmpdir(), 'fence-write-gone-'));
+    rmSync(goneDir, { recursive: true, force: true });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [goneDir]);
+
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId: 'default', localPath: goneDir, slug: 'people/erin', resolutionSource: 'exact_page' },
+      [baseInput()],
+    );
+
+    expect(result.inserted).toBe(0);
+    expect(result.targetUnresolvable).toBe(true);
+    expect(existsSync(goneDir)).toBe(false);
+  });
+});
+
 // Cleanup any leftover tempdirs after the whole suite.
 afterAll(() => {
   // No-op: each test cleaned up via the beforeEach; this is a safety net.
@@ -598,4 +970,24 @@ afterAll(() => {
   } catch {
     /* best-effort */
   }
+});
+
+describe('writeFactsToFence — DB-body mirror never persists an empty content_hash (wave review)', () => {
+  test('a page row with no content_hash gets a non-empty one from the mirror', async () => {
+    const target = { sourceId: 'default', localPath: brainDir, slug: 'people/hashless', resolutionSource: 'exact_page' as const };
+    await writeFactsToFence(engine, target, [baseInput()]);
+    // The fence writer only stub-creates the FILE; sync creates the row. Import
+    // it, then drop the hash to model a row that lost it.
+    const stub = readFileSync(join(brainDir, 'people/hashless.md'), 'utf-8');
+    await importFromContent(engine, 'people/hashless', stub, { noEmbed: true, sourceId: 'default' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (engine as any).db.query(`UPDATE pages SET content_hash = NULL WHERE slug = 'people/hashless'`);
+
+    const r = await writeFactsToFence(engine, target, [baseInput({ fact: 'Raised a seed round' })]);
+    expect(r.inserted).toBe(1);
+    const page = await engine.getPage('people/hashless', { sourceId: 'default' });
+    expect(page?.compiled_truth).toContain('Raised a seed round');
+    expect(typeof page?.content_hash).toBe('string');
+    expect(page!.content_hash!.length).toBeGreaterThan(0);
+  });
 });

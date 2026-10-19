@@ -24,6 +24,7 @@
  * as P2 items in the plan file.
  */
 
+import { retainToolWriteRequestId, awaitCommittedToolWrite, isPendingToolWrite } from '../tool-write-identity.ts';
 import Anthropic from '@anthropic-ai/sdk';
 import type { MinionJobContext, MinionJob } from '../types.ts';
 import { UnrecoverableError } from '../types.ts';
@@ -37,7 +38,7 @@ import type {
 import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
 import { loadConfig, isConfigTruthy } from '../../config.ts';
-import { buildBrainTools, filterAllowedTools } from '../tools/brain-allowlist.ts';
+import { buildBrainTools, selectAllowedTools } from '../tools/brain-allowlist.ts';
 import {
   acquireLease,
   releaseLease,
@@ -48,14 +49,15 @@ import {
   logSubagentSubmission,
   logSubagentHeartbeat,
 } from './subagent-audit.ts';
-import { resolveModel, isAnthropicProvider, TIER_DEFAULTS } from '../../model-config.ts';
+import { resolveModel, isAnthropicProvider, isOpenRouterSubagentFamily, TIER_DEFAULTS } from '../../model-config.ts';
 import { splitProviderModelId, normalizeModelId } from '../../model-id.ts';
 import { resolveAnthropicKey } from '../../ai/anthropic-key.ts';
 import { buildSystemPrompt, DEFAULT_SUBAGENT_SYSTEM } from '../system-prompt.ts';
-import { toolLoop as gatewayToolLoop, isThinkingByDefaultModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../../ai/gateway.ts';
+import { toolLoop as gatewayToolLoop, isThinkingModel, THINKING_MODEL_MAX_OUTPUT_TOKENS } from '../../ai/gateway.ts';
 import type { ChatToolDef, ChatMessage, ChatBlock, ChatResult, ToolHandler } from '../../ai/gateway.ts';
 import { classifyCapabilities } from '../../ai/capabilities.ts';
 import { runSubagentOneshot, ONESHOT_TOOL_USE_ID_PREFIX } from './subagent-oneshot.ts';
+import { directStopReason, gatewayStopReason, replayTerminalStopReason } from '../subagent-stop-reason.ts';
 import type { OneshotFallbackReason } from '../types.ts';
 import {
   loadPriorMessages,
@@ -70,6 +72,12 @@ import {
   type PersistedToolExec,
 } from './subagent-persistence.ts';
 import { randomUUIDv7 } from 'bun';
+import { snapshotFromJob } from '../delegated-policy.ts';
+import { applyDelegatedData, guardDelegatedTools } from '../delegated-tools.ts';
+import { withDelegatedSpend } from '../delegated-spend.ts';
+import { invokeAI, sdkInvocationUsage, hasAIInvocationGuard } from '../../ai/invocation-guard.ts';
+import { chatInvocation } from '../../ai/guarded-generation.ts';
+import { resolveChatPerTurnTimeoutMs } from '../handler-timeouts.ts';
 
 // ── Defaults ────────────────────────────────────────────────
 
@@ -81,9 +89,9 @@ const DEFAULT_RATE_KEY = 'anthropic:messages';
 /**
  * Resolve the per-turn output-token cap (#2778). Per-job data wins, then the
  * `agent.max_output_tokens` config row, then a model-aware default: 32000 for
- * thinking-by-default Claude 5 models (#4087 — they burn most of the budget on
- * internal reasoning; the flat 8192 default produced zero-tool-call truncated
- * runs even after the gateway learned to detect them), 8192 for everything
+ * thinking-by-default models (#4087 Claude 5 by name, #4172 recipe-declared
+ * such as DeepSeek v4: they burn most of the budget on internal reasoning; the
+ * flat 8192 default produced zero-tool-call truncated runs), 8192 for everything
  * else (was a hardcoded 4096 that made pages >~12KB unwritable via put_page).
  * Invalid values (NaN / zero / negative) fall through to the next tier.
  */
@@ -99,7 +107,7 @@ export function resolveMaxOutputTokens(
     const n = Number(configRaw);
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
-  return isThinkingByDefaultModel(model) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_MAX_OUTPUT_TOKENS;
+  return isThinkingModel(model) ? THINKING_MODEL_MAX_OUTPUT_TOKENS : DEFAULT_MAX_OUTPUT_TOKENS;
 }
 
 /**
@@ -139,7 +147,7 @@ const DEFAULT_SYSTEM = DEFAULT_SUBAGENT_SYSTEM;
  * structurally; tests can substitute a mock without the SDK import.
  */
 export interface MessagesClient {
-  create(params: Anthropic.MessageCreateParamsNonStreaming, opts?: { signal?: AbortSignal }): Promise<Anthropic.Message>;
+  create(params: Anthropic.MessageCreateParamsNonStreaming, opts?: { signal?: AbortSignal; maxRetries?: number }): Promise<Anthropic.Message>;
 }
 
 export interface SubagentDeps {
@@ -185,14 +193,16 @@ export interface SubagentDeps {
 
 /**
  * F1 (adversarial review): a replayed terminal assistant turn that hit the
- * output cap must NOT launder into 'end_turn'. The zero-attempt honesty gate
- * (finalizeWriteAccounting) keys on stop_reason, and a truncated zero-write
- * run replaying as a clean finish would consume the transcript's idempotency
- * key with zero pages written — the exact silent-loss class #4217 kills. The
- * live stop reason is not persisted; `tokens_out >= cap` recovers it (a
- * length stop reports the capped count). A clean turn producing EXACTLY cap
- * tokens is a theoretical false positive; its consequence is dead-letter +
- * key release + nightly retry — self-healing, never silent loss.
+ * output cap must NOT launder into 'end_turn' (replayTerminalStopReason in
+ * ../subagent-stop-reason.ts, which also maps an empty persisted turn to
+ * 'error', #6448). The zero-attempt honesty gate (finalizeWriteAccounting)
+ * keys on stop_reason, and a truncated zero-write run replaying as a clean
+ * finish would consume the transcript's idempotency key with zero pages
+ * written — the exact silent-loss class #4217 kills. The live stop reason is
+ * not persisted; `tokens_out >= cap` recovers it (a length stop reports the
+ * capped count). A clean turn producing EXACTLY cap tokens is a theoretical
+ * false positive; its consequence is dead-letter + key release + nightly
+ * retry — self-healing, never silent loss.
  */
 /**
  * Convert a lease-lost abort into the lease-full requeue vocabulary. When
@@ -214,15 +224,28 @@ async function runLoopConvertingLeaseLoss<T>(
     if (wasLeaseLost()) {
       throw new RateLeaseUnavailableError(leaseKey, maxConcurrent, maxConcurrent);
     }
+    // Same terminal classification the legacy raw-SDK path applies below
+    // (see isPromptTooLongError's call site): a 400 "prompt is too long" is
+    // unrecoverable — retrying with the same prompt will always fail the
+    // same way. `e` here is already normalizeAIError()-wrapped (thrown by
+    // gateway.chat()'s catch boundary), which copies only the OUTER message
+    // onto the new error and stores the raw provider error on `.cause` —
+    // isPromptTooLongError() walks that cause chain so the SDK's inner
+    // `.error.message` shape (Anthropic's actual wire shape) still matches
+    // post-wrap. Without this, a gateway-native subagent job (required for
+    // any non-Anthropic model) retries a prompt-too-long condition like any
+    // other transient failure up to max_stalled instead of fast-failing —
+    // the exact dream-cycle queue-clog class the legacy-path fix was built
+    // to prevent, just on the newer path.
+    // Single walk: extractPromptTooLongDetail is non-null exactly when
+    // isPromptTooLongError matches (both wrap the same matcher). The detail is
+    // the matched provider text ("prompt is too long: N tokens > max"), not
+    // `e.message` — post-normalizeAIError that is only the generic outer
+    // wrapper; the useful token counts live on `.cause`, same as the match.
+    const detail = extractPromptTooLongDetail(e);
+    if (detail !== null) throw new UnrecoverableError(`prompt_too_long: ${detail}`);
     throw e;
   }
-}
-
-function replayTerminalStopReason(
-  tokensOut: number | null | undefined,
-  maxOutputTokens: number,
-): SubagentStopReason {
-  return tokensOut != null && tokensOut >= maxOutputTokens ? 'max_tokens' : 'end_turn';
 }
 
 export function makeSubagentHandler(deps: SubagentDeps) {
@@ -252,7 +275,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       fallbackReason?: OneshotFallbackReason;
       oneshotTokens?: { in: number; out: number; cache_read: number; cache_create: number };
     } = {};
-    const inner = await subagentHandlerInner(ctx, modeState);
+    const submitted = snapshotFromJob(ctx.data);
+    const inner = await withDelegatedSpend(engine, submitted, ctx.id, () => subagentHandlerInner(ctx, modeState));
     // #4216: stamp which execution path produced the result. Jobs with no
     // `mode` field keep the legacy result shape (REGRESSION pin).
     // Honesty rule: 'agentic_fallback' is stamped ONLY when the oneshot
@@ -285,7 +309,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         ? { ...inner, synth_mode_used: 'agentic' }
         : inner;
     return finalizeWriteAccounting(engine, ctx.id, stamped, {
-      requireWrites: dataForAccounting.require_writes === true,
+      requireWrites: dataForAccounting.require_writes === true, allowCleanZeroWrites: dataForAccounting.allow_clean_zero_writes === true,
       // OV-4: a successful oneshot job's verdict is scoped to its own
       // invocation family; a fallback wrote through the loop (no oneshot
       // rows exist — validation precedes all writes), so job-wide is exact.
@@ -300,7 +324,9 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     oneshotTokens?: { in: number; out: number; cache_read: number; cache_create: number };
   } = {},
   ): Promise<SubagentResult> {
-    const data = (ctx.data ?? {}) as unknown as SubagentHandlerData;
+    const data = { ...(ctx.data ?? {}) } as unknown as SubagentHandlerData;
+    const submitted = snapshotFromJob(ctx.data);
+    await applyDelegatedData(engine, submitted, ctx.id, data);
     if (!data.prompt || typeof data.prompt !== 'string') {
       throw new Error('subagent job data.prompt is required (string)');
     }
@@ -325,8 +351,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // resolveModel's explicit-key branch, which does NOT run
     // enforceSubagentCapable's silent fallback (only the inherited
     // models.default / tier / env branches do). An explicitly chosen
-    // tool-incapable model must be refused loudly here rather than silently
-    // run a loop that has no way to dispatch tools.
+    // loop-incapable model must be refused loudly here rather than silently
+    // run a loop that can't dispatch tools or can't reconcile on replay.
     // The queue.ts gate already catches explicit data.model at submit; this
     // check additionally covers config-resolved models, direct `gbrain agent
     // run` invocations, and any path that bypasses the queue's check.
@@ -335,7 +361,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // message is a terminal assistant turn (no tool_use blocks) needs NO
     // further provider call — the path-specific replay logic below returns
     // the already-committed result. Don't let a capability refusal (e.g.
-    // config repointed to a tool-incapable model between submit and replay)
+    // config repointed to a loop-incapable model between submit and replay)
     // dead-letter completed work.
     {
       const lastRows = await engine.executeRaw<{ role: string; content_blocks: unknown }>(
@@ -351,8 +377,9 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         : null;
       // Terminal = assistant turn with NO pending tool dispatch in EITHER
       // block vocabulary (legacy Anthropic `tool_use`, gateway `tool-call`)
-      // AND actual text (the gateway terminal rule) — a pending-tool replay
-      // must still pass the gate before the loop resumes on the provider.
+      // AND actual text — stricter than the replay rule (#6448: an empty
+      // tail replays as 'error' with no provider call), because an empty
+      // tail holds no completed work for this exception to protect.
       const alreadyTerminal = lastRow?.role === 'assistant'
         && Array.isArray(lastBlocks)
         && !lastBlocks.some(b => b?.type === 'tool_use' || b?.type === 'tool-call')
@@ -379,6 +406,13 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           `The subagent loop dispatches brain ops via tool calls — without tool support the loop has no way to run.`,
         );
       }
+      if (verdict === 'unusable:no_subagent_loop') {
+        throw new Error(
+          `subagent job rejected: ${modelSource} "${model}" comes from a provider whose recipe declares ` +
+          `supports_subagent_loop: false — its tool_call_ids are not stable enough across crashes/replays ` +
+          `to drive the subagent loop.`,
+        );
+      }
       if (verdict === 'unknown') {
         throw new Error(
           `subagent job rejected: ${modelSource} "${model}" references an unknown provider. ` +
@@ -396,6 +430,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       await engine.getConfig('agent.max_output_tokens').catch(() => null),
       model,
     );
+    const turnTimeoutMs = resolveChatPerTurnTimeoutMs(await engine.getConfig('ai.chat.per_turn_timeout_ms').catch(() => null));
     // v0.41 Approach C: systemPrompt is now built AFTER toolDefs (a few
     // lines below) so the renderer can splice a tool-usage preamble
     // listing each available tool's usage_hint. The renderer is
@@ -410,7 +445,11 @@ export function makeSubagentHandler(deps: SubagentDeps) {
     // #2753: share the doctor's truthiness set. Before this, the doctor accepted
     // yes/on but the worker did not, so `config set ... yes` reported healthy
     // here and still refused the job below.
-    const useGatewayLoop = isConfigTruthy(useGatewayLoopRaw);
+    // OpenRouter routes are not `isAnthropicProvider` (the Messages SDK
+    // cannot speak OR). Auto-enable the gateway loop for the OR families
+    // that have a live abort/retry pin (anthropic/, deepseek/) so the legacy
+    // pin does not refuse them when the flag is off.
+    const useGatewayLoop = isConfigTruthy(useGatewayLoopRaw) || isOpenRouterSubagentFamily(model);
     if (!useGatewayLoop && !isAnthropicProvider(model)) {
       throw new Error(
         `subagent job: resolved model "${model}" is non-Anthropic but agent.use_gateway_loop is not enabled. ` +
@@ -433,11 +472,11 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       brainId: data.brain_id,
       allowedSlugPrefixes: data.allowed_slug_prefixes,
       // #1586: cycle-resolved source scope for tool-call OperationContexts.
-      sourceId: data.source_id,
+      sourceId: data.source_id, readBudgetBytes: data.read_budget_bytes,
     });
-    const toolDefs = data.allowed_tools && data.allowed_tools.length > 0
-      ? filterAllowedTools(registry, data.allowed_tools)
-      : registry;
+    const selectedTools = selectAllowedTools(registry, data.allowed_tools);
+    const guardTools = (tools: ToolDef[], deferEmbeds = false) => guardDelegatedTools(engine, config, submitted, ctx.id, tools, deps.toolRegistry !== undefined, deferEmbeds);
+    const toolDefs = guardTools(selectedTools);
 
     // v0.41 Approach C: render the final system prompt now that toolDefs
     // is known. Splices a deterministic tool-usage preamble listing each
@@ -499,26 +538,27 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           brainId: data.brain_id,
           allowedSlugPrefixes: data.allowed_slug_prefixes,
           sourceId: data.source_id,
-          deferEmbeds: true,
+          deferEmbeds: true, readBudgetBytes: data.read_budget_bytes,
         });
         // Honor allowed_tools EXACTLY like the loop registry — a submitter
         // that scoped its job read-only must not gain write capability by
         // setting mode: oneshot (put_page filtered out → no_put_page_tool
         // fallback → the equally-filtered loop).
-        const oneshotTools = data.allowed_tools && data.allowed_tools.length > 0
-          ? filterAllowedTools(oneshotRegistry, data.allowed_tools)
-          : oneshotRegistry;
+        const oneshotSelectedTools = selectAllowedTools(oneshotRegistry, data.allowed_tools);
+        const oneshotTools = guardTools(oneshotSelectedTools, true);
         const outcome = await runSubagentOneshot({
           engine,
           ctx,
           data,
           model,
           maxOutputTokens,
+          turnTimeoutMs,
           putPageTool: oneshotTools.find(t => t.name === 'brain_put_page'),
           leaseKey: gatewayLeaseKey,
           maxConcurrent,
           leaseTtlMs,
-          _chat: deps._chat,
+          _chat: deps._chat ? opts => invokeAI(chatInvocation('subagent_oneshot', normalizeModelId(model), maxOutputTokens),
+            () => deps._chat!(opts), sdkInvocationUsage) : undefined,
         });
         if (outcome.kind === 'done') return outcome.result;
         modeState.fallbackReason = outcome.reason;
@@ -538,6 +578,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         toolDefs,
         maxTurns,
         maxOutputTokens,
+        turnTimeoutMs,
         leaseKey: gatewayLeaseKey,
         maxConcurrent,
         leaseTtlMs,
@@ -618,7 +659,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         return {
           result: finalText,
           turns_count: assistantTurns,
-          stop_reason: replayTerminalStopReason(last.tokens_out, maxOutputTokens),
+          stop_reason: replayTerminalStopReason(last.tokens_out, maxOutputTokens, finalText),
           tokens: tokenTotals,
         };
       }
@@ -659,17 +700,19 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           if (prior?.status === 'pending' && !toolDef.idempotent) {
             throw new Error(`non-idempotent tool "${use.name}" pending on resume; cannot safely re-run`);
           }
+          retainToolWriteRequestId(use.input, ctx.id, last.message_idx, useOrdinal, use.id, use.name);
           await persistToolExecPending(engine, ctx.id, last.message_idx, useOrdinal, use.id, use.name, use.input);
           try {
-            const output = await toolDef.execute(use.input, {
+            const output = await awaitCommittedToolWrite(ctx, use.name, () => toolDef.execute(use.input, {
               engine, jobId: ctx.id, remote: true, signal: ctx.signal,
-            });
+            }));
             await persistToolExecComplete(engine, ctx.id, last.message_idx, useOrdinal, use.id, output);
             synthesizedResults.push({
               type: 'tool_result', tool_use_id: use.id,
               content: asStringIfNotObject(output),
             } as ContentBlock);
           } catch (e) {
+            if (isPendingToolWrite(e)) throw e;
             const errText = e instanceof Error ? (e.stack ?? e.message) : String(e);
             await persistToolExecFailed(engine, ctx.id, last.message_idx, useOrdinal, use.id, use.name, use.input, errText);
             synthesizedResults.push({
@@ -854,7 +897,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         };
 
         const combinedSignal = mergeSignals(mergeSignals(ctx.signal, ctx.shutdownSignal), leaseLost.signal);
-        assistantMsg = await client.create(params, { signal: combinedSignal });
+        assistantMsg = await invokeAI({ ...chatInvocation('subagent_legacy', normalizeModelId(model), maxOutputTokens), cacheWriteTtl: '5m' },
+          () => client.create(params, { signal: combinedSignal, ...(hasAIInvocationGuard() ? { maxRetries: 0 } : {}) }), sdkInvocationUsage);
       } catch (err) {
         // Release lease eagerly on error so we don't starve capacity.
         clearInterval(leaseRenewTimer);
@@ -929,15 +973,16 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           b.type === 'tool_use',
       );
       if (toolUses.length === 0) {
-        // #2778: an output-cap hit is NOT end_turn — the text (and possibly a
-        // dropped trailing tool_use block) is truncated. Surface it as its own
-        // stop_reason instead of silently reporting a clean end_turn.
-        stopReason = assistantMsg.stop_reason === 'max_tokens' ? 'max_tokens' : 'end_turn';
         // Concatenate text blocks as the final answer.
         finalText = blocks
           .filter(b => b.type === 'text' && typeof b.text === 'string')
           .map(b => b.text as string)
           .join('\n');
+        // #2778: an output-cap hit is NOT end_turn — the text (and possibly a
+        // dropped trailing tool_use block) is truncated. #6448: a refusal is
+        // 'refusal' and an empty body on a clean stop is 'error', never a
+        // silently reported clean end_turn.
+        stopReason = directStopReason(assistantMsg.stop_reason, finalText);
         break;
       }
 
@@ -1000,17 +1045,18 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         }
 
         // Fresh or idempotent-replay dispatch.
+        retainToolWriteRequestId(use.input, ctx.id, assistantIdx, useOrdinal, use.id, toolName);
         await persistToolExecPending(engine, ctx.id, assistantIdx, useOrdinal, use.id, toolName, use.input);
         logSubagentHeartbeat({ job_id: ctx.id, event: 'tool_called', turn_idx: turnIdx, tool_name: toolName });
 
         const toolStart = Date.now();
         try {
-          const output = await toolDef.execute(use.input, {
+          const output = await awaitCommittedToolWrite(ctx, toolName, () => toolDef.execute(use.input, {
             engine,
             jobId: ctx.id,
             remote: true,
             signal: ctx.signal,
-          });
+          }));
           await persistToolExecComplete(engine, ctx.id, assistantIdx, useOrdinal, use.id, output);
           logSubagentHeartbeat({
             job_id: ctx.id,
@@ -1025,6 +1071,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
             content: asStringIfNotObject(output),
           } as ContentBlock);
         } catch (e) {
+          if (isPendingToolWrite(e)) throw e;
           const errText = e instanceof Error
             ? (e.stack ?? e.message)
             : String(e);
@@ -1101,6 +1148,8 @@ interface GatewayRunArgs {
   maxTurns: number;
   /** #2778: per-turn output-token cap (resolved by resolveMaxOutputTokens). */
   maxOutputTokens: number;
+  /** `ai.chat.per_turn_timeout_ms`: each turn's chat backstop (#4921). */
+  turnTimeoutMs: number;
   /**
    * #4194/CDX-7 — per-turn rate-lease parameters. Pre-fix the gateway path
    * made provider calls with no lease at all (the legacy loop's acquisition
@@ -1129,7 +1178,7 @@ interface GatewayRunArgs {
  * reconciler sees both shapes uniformly.
  */
 async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResult> {
-  const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns, maxOutputTokens, leaseKey, maxConcurrent, leaseTtlMs } = args;
+  const { engine, ctx, data, model, systemPrompt, toolDefs, maxTurns, maxOutputTokens, turnTimeoutMs, leaseKey, maxConcurrent, leaseTtlMs } = args;
 
   // Map ToolDef → ChatToolDef (gateway shape). The gateway's chat() bridges
   // this to provider-specific tool definitions via the Vercel AI SDK.
@@ -1142,16 +1191,20 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
   // Map ToolDef → ToolHandler (gateway shape). Each handler is a thin wrapper
   // that invokes the existing brain-tool dispatch.
   const toolHandlers = new Map<string, ToolHandler>();
+  // toolLoop invokes execute/failure hooks sequentially; preserve the typed
+  // receipt across its string-only failure hook without settling the ledger.
+  let pendingToolWrite: unknown;
   for (const t of toolDefs) {
     toolHandlers.set(t.name, {
       idempotent: t.idempotent === true,
       async execute(input: unknown, signal: AbortSignal): Promise<unknown> {
-        return await t.execute(input, {
-          engine,
-          jobId: ctx.id,
-          remote: true,
-          signal,
-        });
+        try {
+          return await awaitCommittedToolWrite({ deadlineAtMs: ctx.deadlineAtMs, signal }, t.name,
+            () => t.execute(input, { engine, jobId: ctx.id, remote: true, signal }));
+        } catch (error) {
+          if (isPendingToolWrite(error)) pendingToolWrite = error;
+          throw error;
+        }
       },
     });
   }
@@ -1195,6 +1248,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       priorTools: priorToolsV1,
       toolDefs,
       signal: ctx.signal,
+      jobDeadlineAtMs: ctx.deadlineAtMs,
     });
 
   // Terminal early-return (#1151 parity): the prior run already reached
@@ -1205,7 +1259,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     return {
       result: terminalText,
       turns_count: priorChatMessages.filter(m => m.role === 'assistant').length,
-      stop_reason: replayTerminalStopReason(lastAssistant?.tokens_out, maxOutputTokens),
+      stop_reason: replayTerminalStopReason(lastAssistant?.tokens_out, maxOutputTokens, terminalText),
       tokens: priorTokens,
     };
   }
@@ -1264,6 +1318,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     maxTurns,
     maxTokens: maxOutputTokens,
     abortSignal: ctx.signal,
+    turnTimeoutMs,
     cacheSystem,
     // #4194/CDX-7: every provider round-trip holds a rate-lease slot (worker
     // parity with the legacy loop's per-turn acquisition). Lease-full throws
@@ -1343,6 +1398,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       heartbeat('llm_call_completed', { turn_idx: turnIdx, tokens: usage });
     },
     onToolCallStart: async (turnIdx, messageIdx, ordinal, toolName, input, providerToolCallId) => {
+      retainToolWriteRequestId(input, ctx.id, messageIdx, ordinal, providerToolCallId, toolName);
       // CRITICAL — read back the canonical gbrain_tool_use_id from RETURNING,
       // NOT the locally-generated UUID. On crash-replay the (job_id,
       // message_idx, ordinal) row already exists with the ORIGINAL UUID from
@@ -1389,6 +1445,7 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
       );
     },
     onToolCallFailed: async (gbrainToolUseId, errorMsg) => {
+      if (pendingToolWrite) throw pendingToolWrite;
       await engine.executeRaw(
         `UPDATE subagent_tool_executions
            SET status = 'failed', error = $1, ended_at = now()
@@ -1419,23 +1476,10 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
     maxConcurrent,
   );
 
-  // Map gateway stop reason to SubagentStopReason. 'length' (output-cap hit)
-  // maps to 'max_tokens' — the #2778 honesty vocabulary the direct Anthropic
-  // path already uses — NOT 'end_turn' (#4088: truncation is not a clean
-  // finish). aborted maps to error.
-  const stopReason: SubagentStopReason = result.stopReason === 'end'
-    ? 'end_turn'
-    : result.stopReason === 'length'
-      ? 'max_tokens'
-      : result.stopReason === 'max_turns'
-        ? 'max_turns'
-        : result.stopReason === 'refusal'
-          ? 'refusal'
-          : result.stopReason === 'content_filter'
-            ? 'refusal'
-            : result.stopReason === 'aborted'
-              ? 'error'
-              : 'end_turn';
+  // Map gateway stop reason to SubagentStopReason (../subagent-stop-reason.ts):
+  // 'length' is 'max_tokens' (#2778/#4088: truncation is not a clean finish);
+  // empty_response, aborted and unrecoverable are 'error' (#6448).
+  const stopReason: SubagentStopReason = gatewayStopReason(result.stopReason);
 
   return {
     result: result.finalText,
@@ -1457,6 +1501,8 @@ interface ReconcileArgs {
   priorTools: PersistedToolExec[];
   toolDefs: ToolDef[];
   signal: AbortSignal;
+  /** Bounds how long a re-dispatched pending tool write keeps replaying (#5474). */
+  jobDeadlineAtMs: number | null;
 }
 
 interface ReconcileResult {
@@ -1590,12 +1636,15 @@ async function reconcileGatewayReplay(args: ReconcileArgs): Promise<ReconcileRes
       if (exec?.status === 'pending' && !toolDef.idempotent) {
         throw new Error(`non-idempotent tool "${call.toolName}" pending on resume; cannot safely re-run`);
       }
+      retainToolWriteRequestId(call.input, jobId, msg.message_idx, callIdx, call.toolCallId, call.toolName);
       await persistToolExecPending(engine, jobId, msg.message_idx, callIdx, call.toolCallId, call.toolName, call.input);
       try {
-        const output = await toolDef.execute(call.input, { engine, jobId, remote: true, signal });
+        const output = await awaitCommittedToolWrite({ deadlineAtMs: args.jobDeadlineAtMs, signal }, call.toolName,
+          () => toolDef.execute(call.input, { engine, jobId, remote: true, signal }));
         await persistToolExecComplete(engine, jobId, msg.message_idx, callIdx, call.toolCallId, output);
         results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output });
       } catch (e) {
+        if (isPendingToolWrite(e)) throw e;
         const errText = e instanceof Error ? (e.stack ?? e.message) : String(e);
         await persistToolExecFailed(engine, jobId, msg.message_idx, callIdx, call.toolCallId, call.toolName, call.input, errText);
         results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: errText, isError: true });
@@ -1616,20 +1665,19 @@ async function reconcileGatewayReplay(args: ReconcileArgs): Promise<ReconcileRes
 
   const chatMessages: ChatMessage[] = work.map(w => ({ role: w.role, content: w.blocks }));
 
-  // Terminal case: the transcript already ends on an assistant turn that
-  // carried real text and made no tool calls (prior run reached end_turn).
-  // Surface its text; skip the loop. An assistant turn whose blocks are all
-  // empty (e.g. a reasoning-only/null-text turn that adaptation dropped) is NOT
-  // terminal — falling through lets the loop re-issue the call rather than
-  // returning an empty result.
+  // Terminal case: the transcript already ends on an assistant turn that made
+  // no tool calls (the prior run reached its last turn). Surface its text and
+  // skip the loop. #6448: ANY such tail is terminal, text or not — a
+  // reasoning-only / blank turn re-issued to the provider would end the
+  // request on an assistant message (a prefill Haiku 5.5 rejects with HTTP
+  // 400); the caller maps the empty text to stop_reason 'error' instead.
   const lastMsg = work[work.length - 1];
   let terminalText: string | null = null;
   if (lastMsg && lastMsg.role === 'assistant' && !lastMsg.blocks.some(b => b.type === 'tool-call')) {
-    const text = lastMsg.blocks
+    terminalText = lastMsg.blocks
       .filter((b): b is Extract<ChatBlock, { type: 'text' }> => b.type === 'text')
       .map(b => b.text)
       .join('\n');
-    if (text.trim() !== '') terminalText = text;
   }
 
   return { chatMessages, nextMessageIdx: maxIdx + 1, terminalText };
@@ -1683,6 +1731,12 @@ function adaptContentBlocksToChatBlocks(blocks: unknown): ChatBlock[] | string {
       : {};
     if (t === 'text' && typeof block.text === 'string') {
       out.push({ type: 'text', text: block.text, ...meta });
+    } else if (t === 'reasoning' && typeof block.text === 'string') {
+      // OpenAI Responses API reasoning-item id (providerMetadata.openai.itemId)
+      // — see the ChatBlock doc comment. Must survive crash-replay the same
+      // way tool-call providerMetadata does, or a resumed reasoning-model
+      // tool loop dead-letters on its next turn.
+      out.push({ type: 'reasoning', text: block.text, ...meta });
     } else if (t === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
       // v1 Anthropic shape
       out.push({
@@ -1774,16 +1828,53 @@ export { RateLeaseUnavailableError } from '../rate-leases.ts';
  * Case-insensitive on the phrase. Also matches `request_too_large` and
  * `invalid_request_error` types when accompanied by the same message.
  *
+ * Walks up to 3 levels of `.cause` (bounded, same depth as
+ * classifyGlobalLlmError in errors.ts): gateway.chat()'s catch boundary
+ * wraps every error via normalizeAIError(), which copies only the OUTER
+ * `.message` onto the new AIConfigError/AITransientError and stores the
+ * original raw error on `.cause` — the SDK's `.error.message` inner shape
+ * (the one Anthropic actually uses, per the existing "matches when message
+ * is on the inner .error.message field" unit test below) is otherwise lost
+ * post-normalization, silently defeating detection on the gateway-native
+ * path where callers only ever see the already-normalized error.
+ *
  * Exported for unit testing.
  */
 export function isPromptTooLongError(err: unknown): boolean {
-  if (!err) return false;
+  return findPromptTooLongMatch(err) !== null;
+}
+
+/**
+ * Same bounded `.cause` walk as isPromptTooLongError, but returns the
+ * matched phrase-bearing text (e.g. "prompt is too long: 1707509 tokens >
+ * 1000000 maximum") instead of a boolean — used at the terminal-classification
+ * call site so a normalizeAIError()-wrapped error's dead-letter message
+ * carries the actually useful provider detail instead of the generic outer
+ * wrapper text (e.g. "BadRequestError"). Returns null when no match (mirrors
+ * isPromptTooLongError returning false for the same input).
+ */
+export function extractPromptTooLongDetail(err: unknown): string | null {
+  return findPromptTooLongMatch(err);
+}
+
+function findPromptTooLongMatch(err: unknown): string | null {
+  let cur: unknown = err;
+  for (let depth = 0; depth < 3 && cur != null; depth++) {
+    const matched = matchesPromptTooLong(cur);
+    if (matched !== null) return matched;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
+function matchesPromptTooLong(err: unknown): string | null {
+  if (!err) return null;
   // Walk both `.message` and `.error?.message` shapes.
   const msg = (err as { message?: unknown })?.message;
   const inner = (err as { error?: { message?: unknown } })?.error?.message;
   const candidates = [msg, inner].filter((s): s is string => typeof s === 'string');
   for (const c of candidates) {
-    if (/prompt is too long/i.test(c)) return true;
+    if (/prompt is too long/i.test(c)) return c;
   }
   // Anthropic SDK wraps with .status; 400 + 'invalid_request_error' /
   // 'request_too_large' types both indicate the same class. Only treat
@@ -1793,10 +1884,10 @@ export function isPromptTooLongError(err: unknown): boolean {
   const errType = (err as { error?: { type?: unknown } })?.error?.type;
   if (status === 400 && (errType === 'invalid_request_error' || errType === 'request_too_large')) {
     for (const c of candidates) {
-      if (/too long|exceed|maximum/i.test(c)) return true;
+      if (/too long|exceed|maximum/i.test(c)) return c;
     }
   }
-  return false;
+  return null;
 }
 
 // ── Testing surface ─────────────────────────────────────────

@@ -45,6 +45,7 @@ import { createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import { configDir } from '../config.ts';
 import { canonicalLookup } from '../model-pricing.ts';
+import { providerDeclineRecord } from '../setup/local-receipts.ts';
 // Type-only import — erased at compile, so no runtime cycle with
 // model-config.ts (which imports this module for the sync overlay).
 import type { ModelTier } from '../model-config.ts';
@@ -115,6 +116,13 @@ export function parseOpenAIChatId(id: string): ParsedOpenAIChatId | null {
   return { id, family: [Number(m[1]), Number(m[2] ?? 0)], suffix };
 }
 
+/**
+ * Priced for exact metering where a feature names the model (the #6188 fence
+ * repair default), but not eligible as a discovered tier default: one priced
+ * member of a newer family would otherwise become every tier's default.
+ */
+const METERED_ONLY: ReadonlySet<string> = new Set(['gpt-6.1-sol']);
+
 function familyCmp(a: [number, number], b: [number, number]): number {
   return a[0] !== b[0] ? a[0] - b[0] : a[1] - b[1];
 }
@@ -135,7 +143,7 @@ function pickBySuffix(members: ParsedOpenAIChatId[], order: readonly string[]): 
  */
 export function rankOpenAIChatModels(
   ids: string[],
-  priced: (id: string) => boolean = (id) => canonicalLookup(`openai:${id}`) !== undefined,
+  priced: (id: string) => boolean = (id) => canonicalLookup(`openai:${id}`) !== undefined && !METERED_ONLY.has(id),
 ): { tiers: OpenAITierPick | null; newestUnpriced?: string } {
   const parsed = ids.map(parseOpenAIChatId).filter((p): p is ParsedOpenAIChatId => p !== null);
   if (parsed.length === 0) return { tiers: null };
@@ -183,22 +191,37 @@ export function rankOpenAIChatModels(
 
 /* ── sync cache read (the resolveTierDefault overlay) ─────────────────────── */
 
-// mtime-keyed memo: the sync read fires per model resolution on OpenAI-keyed
+// File-identity-keyed memo: the sync read fires per model resolution on OpenAI-keyed
 // installs — statSync is far cheaper than read+parse, and staleness is
 // already tolerated by design. Keyed on path too (GBRAIN_HOME can change in
-// tests). Invalidated implicitly: a refresh write bumps the mtime.
-let _cacheMemo: { path: string; mtimeMs: number; value: ModelCacheFile | null } | null = null;
+// tests). mtime alone is insufficient: two fast writes can share an observed
+// timestamp, while an external atomic rename can preserve it deliberately.
+// ino changes across atomic replacement, whether the write comes from this
+// process or a concurrent one (readCacheFile() always re-stats and re-reads
+// on a mismatch — writeCacheFile() deliberately does not memo its own write,
+// since statting post-rename can race a peer process's own atomic replace).
+let _cacheMemo: {
+  path: string;
+  mtimeMs: number;
+  ino: number;
+  value: ModelCacheFile | null;
+} | null = null;
 
 function readCacheFile(): ModelCacheFile | null {
   const path = cachePath();
   try {
-    const mtimeMs = statSync(path).mtimeMs;
-    if (_cacheMemo && _cacheMemo.path === path && _cacheMemo.mtimeMs === mtimeMs) {
+    const { mtimeMs, ino } = statSync(path);
+    if (
+      _cacheMemo &&
+      _cacheMemo.path === path &&
+      _cacheMemo.mtimeMs === mtimeMs &&
+      _cacheMemo.ino === ino
+    ) {
       return _cacheMemo.value;
     }
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as ModelCacheFile;
     const value = parsed?.version === 1 ? parsed : null;
-    _cacheMemo = { path, mtimeMs, value };
+    _cacheMemo = { path, mtimeMs, ino, value };
     return value;
   } catch {
     _cacheMemo = null;
@@ -221,6 +244,7 @@ export function latestOpenAITiers(tier?: ModelTier): OpenAITierPick | string | n
 /* ── refresh (async, throttled, fail-open) ────────────────────────────────── */
 
 let _refreshInFlight: Promise<void> | null = null;
+let _refreshInFlightFp = '';
 let _warnedUnpriced: string | null = null;
 // Failure backoff: a persistently-failing refresh (blackholed network,
 // revoked key, unwritable config dir — nothing lands in the cache, so the
@@ -239,7 +263,15 @@ function accountFingerprint(base: string, apiKey: string): string {
   return createHash('sha256').update(`${base}|${apiKey}`).digest('hex').slice(0, 16);
 }
 
-/** Atomic cache write (tmp + rename) so a concurrent sync reader never sees a torn file. */
+/**
+ * Atomic cache write (tmp + rename) so a concurrent sync reader never sees a
+ * torn file. Deliberately does NOT refresh `_cacheMemo` here: statting `path`
+ * post-rename can observe a DIFFERENT process's file if that process wins an
+ * atomic replace in the same window (measured ~167µs), which would poison
+ * this process's memo with someone else's (mtimeMs, ino) pair keyed to a
+ * value that isn't what's actually on disk long-term. The next `readCacheFile()`
+ * call re-stats and self-heals through the normal cache-miss path instead.
+ */
 function writeCacheFile(next: ModelCacheFile): void {
   const path = cachePath();
   mkdirSync(dirname(path), { recursive: true });
@@ -272,6 +304,7 @@ function stampAttempt(fp: string): void {
 
 export function _resetOpenAILatestForTests(): void {
   _refreshInFlight = null;
+  _refreshInFlightFp = '';
   _warnedUnpriced = null;
   _lastAttemptAt = 0;
   _lastAttemptFp = '';
@@ -290,9 +323,11 @@ export interface RefreshOpts {
 /**
  * Refresh the discovery cache from `GET /v1/models`, at most once per TTL.
  * Best-effort by contract: never throws, never blocks longer than
- * FETCH_TIMEOUT_MS, no-ops without a key or with GBRAIN_MODEL_DISCOVERY=off.
- * Call sites: reconfigureGatewayWithEngine (engine connect) and — through
- * it — the jobs worker's per-job gateway refresh.
+ * FETCH_TIMEOUT_MS, no-ops without a key, with GBRAIN_MODEL_DISCOVERY=off, or
+ * when a `gbrain setup` receipt recorded provider use as declined.
+ * Call site: the gateway's discoverBeforeOpenAICall, once per reconfigure,
+ * when an OpenAI-routed call is about to go out (#6607: never on engine
+ * connect, so a brain that never calls OpenAI sends nothing).
  */
 export async function refreshLatestOpenAIModels(opts: RefreshOpts = {}): Promise<void> {
   const disc = process.env.GBRAIN_MODEL_DISCOVERY;
@@ -314,10 +349,19 @@ export async function refreshLatestOpenAIModels(opts: RefreshOpts = {}): Promise
     ? Date.parse(cacheFile?.last_attempt_at ?? '') || 0 : 0;
   const moduleAttempt = _lastAttemptFp === fp ? _lastAttemptAt : 0;
   if (!opts.force && Date.now() - Math.max(moduleAttempt, persistedAttempt) < FAILURE_BACKOFF_MS) return;
+  // A key in the environment is not consent: `gbrain setup` recorded provider
+  // use as declined for this install, so discovery never contacts the account.
+  // An unreadable record fails closed (no request).
+  try { if (providerDeclineRecord()) return; } catch { return; }
 
-  if (_refreshInFlight) return _refreshInFlight;
+  if (_refreshInFlight) {
+    if (_refreshInFlightFp === fp) return _refreshInFlight;
+    await _refreshInFlight;
+    return refreshLatestOpenAIModels(opts);
+  }
   _lastAttemptAt = Date.now();
   _lastAttemptFp = fp;
+  _refreshInFlightFp = fp;
   _refreshInFlight = (async () => {
     try {
       const doFetch = opts.fetchImpl ?? fetch;
@@ -362,6 +406,7 @@ export async function refreshLatestOpenAIModels(opts: RefreshOpts = {}): Promise
       stampAttempt(fp);
     } finally {
       _refreshInFlight = null;
+      _refreshInFlightFp = '';
     }
   })();
   return _refreshInFlight;

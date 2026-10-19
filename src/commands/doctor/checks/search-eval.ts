@@ -8,15 +8,17 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 // Leaf module (no flag surface of its own) — see that file for why this
 // isn't imported from extract-conversation-facts.ts directly (#4135).
-import { ALLOWED_TYPES } from '../../../core/facts/conversation-types.ts';
+import { ALLOWED_TYPES, conversationFactsEligibleSql, pageTypesForAllowed, isConversationFactsEligiblePage, requireParseableConversationFlag } from '../../../core/facts/conversation-types.ts';
+import { checkError } from '../check-fix.ts';
 
 /**
  * v0.32.3 [CDX-20]: surface mode + per-key override drift.
  *
- * Status stays `ok` (never warns; never docks health score). If
- * search.mode is unset → suggest picking one. If overrides contradict
- * the mode (e.g. mode=conservative but cache.enabled=false), say so in
- * the message and paste a `gbrain search modes --reset` fix command.
+ * Original contract: status stays `ok` (never warns; never docks health
+ * score); the hint lives in `message`, including a paste-ready
+ * `gbrain search modes --reset` consolidation command whenever per-key
+ * overrides exist.
+ *
  */
 
 export async function checkSearchMode(engine: BrainEngine): Promise<Check> {
@@ -25,28 +27,45 @@ export async function checkSearchMode(engine: BrainEngine): Promise<Check> {
     const overrides = await engine.listConfigKeys('search.');
     // Exclude search.mode itself + the upgrade-notice state key from the
     // override roster — they aren't knobs.
-    const overrideKeys = overrides.filter(k => k !== 'search.mode' && k !== 'search.mode_upgrade_notice_shown');
+    const overrideKeys = overrides.filter(k => k !== 'search.mode' && k !== 'search.mode_upgrade_notice_shown' && k !== 'search.mode_source');
 
-    if (!mode) {
-      return {
-        name: 'search_mode',
-        status: 'ok',
-        message: 'search.mode is unset (using balanced fallback). Run `gbrain search modes` to see what is running and pick a mode explicitly.',
-      };
+    const { loadSearchModeConfig, resolveSearchMode } = await import('../../../core/search/mode.ts');
+    const loaded = await loadSearchModeConfig(engine);
+    const resetReranker = resolveSearchMode({ mode: loaded.mode }).reranker_model;
+    const context = !mode
+      ? 'search.mode is unset (using balanced fallback). Run `gbrain search modes` to see what is running and pick a mode explicitly.'
+      : overrideKeys.length === 0
+        ? `Mode: ${mode} (no per-key overrides — mode bundle is canonical).`
+        : `Mode: ${mode} with ${overrideKeys.length} per-key override(s) (${overrideKeys.join(', ')}).`;
+
+    if (!mode || overrideKeys.length === 0) {
+      return { name: 'search_mode', status: 'ok', message: context };
     }
 
-    if (overrideKeys.length === 0) {
+    // An explicit `search.reranker.model` equal to the bundle default is
+    // redundant, but `--reset` would also wipe every OTHER tuned search.*
+    // knob — name the exact key instead. (Installs from v0.46.3–v0.47.10
+    // carry an init-written `voyage:rerank-2.5` row; since the default moved
+    // to rerank-3-lite that row is a real pin and keeps them on rerank-2.5.)
+    const redundant: string[] = [];
+    if (resetReranker !== undefined) {
+      const explicitModel = await engine.getConfig('search.reranker.model');
+      if (explicitModel && explicitModel === resetReranker) redundant.push('search.reranker.model');
+    }
+    if (redundant.length > 0 && redundant.length === overrideKeys.length) {
       return {
         name: 'search_mode',
         status: 'ok',
-        message: `Mode: ${mode} (no per-key overrides — mode bundle is canonical).`,
+        message:
+          `${context} The override equals the mode bundle's own default, so it is redundant: ` +
+          `gbrain config unset ${redundant.join(' ')}`,
       };
     }
 
     return {
       name: 'search_mode',
       status: 'ok',
-      message: `Mode: ${mode} with ${overrideKeys.length} per-key override(s) (${overrideKeys.join(', ')}). To consolidate to the pure mode bundle: gbrain search modes --reset`,
+      message: `${context} To consolidate to the pure mode bundle: gbrain search modes --reset`,
     };
   } catch (e) {
     return {
@@ -67,13 +86,30 @@ export async function checkSearchMode(engine: BrainEngine): Promise<Check> {
  */
 export async function checkEvalDrift(engine: BrainEngine): Promise<Check> {
   try {
-    const { watchedFilesDrifted } = await import('../../../core/eval/drift-watch.ts');
-    // Working tree vs HEAD (uncommitted retrieval changes). The fuller
+    const { watchedFilesDrifted, resolveGbrainSourceRoot } = await import('../../../core/eval/drift-watch.ts');
+    // Working tree vs HEAD (uncommitted retrieval changes) in gbrain's OWN
+    // source checkout — never process.cwd(), which is whatever repo the
+    // operator (or the serving process) happens to stand in. The fuller
     // version (vs the commit of the last published eval) is wired when
-    // eval_results lands; today we just probe for uncommitted retrieval
-    // changes so the operator sees them before re-running evals.
-    const repoRoot = process.cwd();
+    // eval_results lands.
+    const repoRoot = resolveGbrainSourceRoot();
+    if (repoRoot === null) {
+      return {
+        name: 'eval_drift',
+        status: 'ok',
+        message: 'Not applicable — gbrain is running as an installed package, not a source checkout; retrieval code changes arrive as version bumps (gbrain --version), not as a git diff.',
+      };
+    }
     const drifted = watchedFilesDrifted(repoRoot);
+    if (drifted === null) {
+      return {
+        name: 'eval_drift',
+        status: 'ok',
+        // No path here: this check is remote-reachable (run_doctor) and the
+        // server's absolute source root is not the caller's business.
+        message: 'Could not probe retrieval drift (git unavailable or the gbrain source root is not a git work tree).',
+      };
+    }
     if (drifted.length === 0) {
       return {
         name: 'eval_drift',
@@ -105,27 +141,6 @@ export async function checkEvalDrift(engine: BrainEngine): Promise<Check> {
  * before a job is submitted.
  */
 
-/**
- * v0.41.2.1 — embedding_env_override (D9 #9). Defense-in-depth for the
- * ze-switch env-override class (the 716K-chunk damage incident from
- * PR #1421's description).
- *
- * GBRAIN_EMBEDDING_MODEL / GBRAIN_EMBEDDING_DIMENSIONS win over DB+file
- * config in loadConfig(). When env disagrees with DB, the gateway embeds
- * with the env-selected model — even after ze-switch wrote a different
- * value to DB. This check surfaces that disagreement on every hourly
- * doctor run so users can spot the drift before the embed sweep corrupts
- * vectors at the wrong width.
- *
- * Uses Check.details (NOT Check.issues, which has a different schema)
- * so the structured `mismatches[]` payload is consumable by monitoring
- * pipelines without ad-hoc type widening.
- *
- * Cross-surface parity: wired into BOTH buildChecks() and
- * doctorReportRemote() — operators running thin-client doctor against
- * a remote brain see the server's env, which is the env that matters
- * for the embed pipeline running there.
- */
 export async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Check> {
   const envModel = process.env.GBRAIN_EMBEDDING_MODEL?.trim();
   const envDim = process.env.GBRAIN_EMBEDDING_DIMENSIONS?.trim();
@@ -184,7 +199,7 @@ export async function checkEmbeddingEnvOverride(engine: BrainEngine): Promise<Ch
  * is mid-transition and retrieval may be degraded until it drains. Warn with
  * the exact resume + status commands.
  */
-export async function checkEmbeddingMigrationState(engine: BrainEngine): Promise<Check> {
+export async function checkEmbeddingMigrationState(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
     const { readMigrationState, migrationSignature, renderResumeCommand } = await import('../../../core/embedding-migration.ts');
     const marker = await readMigrationState(engine);
@@ -201,10 +216,14 @@ export async function checkEmbeddingMigrationState(engine: BrainEngine): Promise
     const s = marker.state;
     let staleNote = '';
     try {
-      const stale = await engine.countStaleChunks({
-        signature: migrationSignature(s.to_model, s.to_dims),
-        includeNullSignature: true,
-      });
+      const signature = migrationSignature(s.to_model, s.to_dims);
+      // A remote caller's grant counts only its own sources' chunks.
+      let stale = 0;
+      if (opts.sourceIds) {
+        for (const sourceId of opts.sourceIds) stale += await engine.countStaleChunks({ sourceId, signature, includeNullSignature: true });
+      } else {
+        stale = await engine.countStaleChunks({ signature, includeNullSignature: true });
+      }
       staleNote = `; ${stale} chunk(s) not yet in the target space`;
     } catch { /* count is best-effort */ }
     return {
@@ -228,9 +247,6 @@ export async function checkEmbeddingMigrationState(engine: BrainEngine): Promise
 export async function checkSubagentCapability(engine: BrainEngine): Promise<Check> {
   try {
     const { classifyCapabilities } = await import('../../../core/ai/capabilities.ts');
-    const modelsSubagent = await engine.getConfig('models.subagent');
-    const tierSubagent = await engine.getConfig('models.tier.subagent');
-    const modelsDefault = await engine.getConfig('models.default');
 
     // Helper: explain a verdict in user-facing terms.
     const explain = (resolved: string, source: string): Check | null => {
@@ -241,7 +257,11 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
           status: 'warn',
           message:
             `${source} is "${resolved}" but that provider/model lacks native tool calling. ` +
-            `The subagent loop cannot run on this model — runtime will fall back to claude-sonnet-4-6. ` +
+            `The subagent loop cannot run on this model — ` +
+            // #5432: an explicit models.subagent is not swapped; dispatch refuses it.
+            (source === 'models.subagent'
+              ? `jobs are refused at dispatch. `
+              : `runtime will fall back to claude-sonnet-4-6. `) +
             `Fix: \`gbrain config set ${source} <provider>:<model-with-tools>\` (e.g. anthropic:claude-sonnet-4-6 or openai:gpt-5.2).`,
         };
       }
@@ -253,6 +273,21 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
             `${source} is "${resolved}" which references an unknown provider. ` +
             `Use a recipe-declared provider. ` +
             `Fix: \`gbrain config set ${source} anthropic:claude-sonnet-4-6\` or pick another known provider.`,
+        };
+      }
+      if (verdict === 'unusable:no_subagent_loop') {
+        return {
+          name: 'subagent_capability',
+          status: 'warn',
+          message:
+            `${source} is "${resolved}" but that provider's recipe declares supports_subagent_loop: false — ` +
+            `its tool calling is not stable enough across crashes/replays to drive the subagent loop. ` +
+            `The subagent loop cannot run on this model — ` +
+            (source === 'models.subagent'
+              ? `jobs are refused at dispatch. `
+              : `runtime will fall back to claude-sonnet-4-6. `) +
+            `Fix: \`gbrain config set ${source} <provider>:<model>\` with a provider whose recipe declares ` +
+            `supports_subagent_loop: true (e.g. anthropic:claude-sonnet-4-6).`,
         };
       }
       if (verdict === 'degraded:no_caching') {
@@ -269,23 +304,23 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
       return null;
     };
 
+    // #4575: resolve in the SAME order as the runtime (resolveModelDetailed:
+    // configKey → models.tier.<tier> → models.default, per the #3873 hoist).
+    // The shared exported precedence list keeps check and runtime from ever
+    // drifting again — pre-fix, the check read models.default before
+    // models.tier.subagent (the pre-#3873 order) and reported an unclearable
+    // warning that its own suggested fix could not retire.
+    const { SUBAGENT_CONFIG_KEY_PRECEDENCE } = await import('../../../core/model-config.ts');
     let resolvedSource: string | null = null;
     let resolvedModel: string | null = null;
-    if (modelsSubagent) {
-      resolvedSource = 'models.subagent';
-      resolvedModel = modelsSubagent;
-      const issue = explain(modelsSubagent, resolvedSource);
+    for (const key of SUBAGENT_CONFIG_KEY_PRECEDENCE) {
+      const value = await engine.getConfig(key);
+      if (!value) continue;
+      resolvedSource = key;
+      resolvedModel = value;
+      const issue = explain(value, key);
       if (issue) return issue;
-    } else if (modelsDefault) {
-      resolvedSource = 'models.default';
-      resolvedModel = modelsDefault;
-      const issue = explain(modelsDefault, 'models.default');
-      if (issue) return issue;
-    } else if (tierSubagent) {
-      resolvedSource = 'models.tier.subagent';
-      resolvedModel = tierSubagent;
-      const issue = explain(tierSubagent, resolvedSource);
-      if (issue) return issue;
+      break;
     }
     // v0.37 (T10 / D7) + v0.38 (D7 capability rename): warn when the configured
     // chat_model is non-Anthropic AND ANTHROPIC_API_KEY isn't set. With
@@ -323,11 +358,7 @@ export async function checkSubagentCapability(engine: BrainEngine): Promise<Chec
         : `Subagent tier resolves to default (claude-sonnet-4-6) — full tool-loop capability`,
     };
   } catch (e) {
-    return {
-      name: 'subagent_capability',
-      status: 'warn',
-      message: `Could not check subagent capability: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError('subagent_capability', 'check subagent capability', e);
   }
 }
 
@@ -369,7 +400,7 @@ export function computeConversationParserProbeHealthCheck(
     return {
       name,
       status: 'ok',
-      message: 'enabled but no probe events in the last 7 days (next run by autopilot; fixtures require a source-checkout install).',
+      message: 'enabled but no probe events in the last 7 days (next run by autopilot).',
     };
   }
   const bad = events.filter(e => e.outcome !== 'pass');
@@ -390,9 +421,68 @@ export function computeConversationParserProbeHealthCheck(
   };
 }
 
+/** Panel fields of a probe audit row, read as untrusted JSON (absent on rows written before #5506). */
+interface ProbeJudgePanelFields {
+  judge_models?: unknown;
+  judge_scored_questions?: unknown;
+  distinct_judge_models?: unknown;
+  distinct_judge_providers?: unknown;
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * The latest run's judge panel, appended to the OK and the WARN message.
+ * A slot (A, B, C in slot order) that scored no question is named; among
+ * the slots that scored, a model holding two or more gets the remedy
+ * (three different models in the slot keys), and fewer than three
+ * providers get the not-cross-modal information. Empty for an event with
+ * missing or malformed panel fields, so its message stays as before; a row
+ * without valid per-slot scored counts treats every slot as having scored.
+ */
+function judgePanelNote(event: ProbeJudgePanelFields): string {
+  const models = event.judge_models;
+  const distinctModels = event.distinct_judge_models;
+  const distinctProviders = event.distinct_judge_providers;
+  if (!Array.isArray(models) || models.length === 0) return '';
+  if (!models.every((m: unknown): m is string => typeof m === 'string')) return '';
+  if (!isCount(distinctModels) || !isCount(distinctProviders)) return '';
+  const counts = event.judge_scored_questions;
+  const scored: number[] | null =
+    Array.isArray(counts) && counts.length === models.length && counts.every(isCount) ? counts : null;
+  const judged = (i: number): boolean => scored === null || scored[i]! > 0;
+  const silent = models
+    .map((m, i) => (judged(i) ? '' : ` Slot ${String.fromCharCode(65 + i)} (${m}) scored no question, so it did not judge.`))
+    .join('');
+  const panel =
+    ` Latest judge panel (slot order): ${models.join(', ')}; ` +
+    `${plural(distinctModels, 'distinct model')} from ${plural(distinctProviders, 'provider')}.${silent}`;
+  const judgedModels = models.filter((_, i) => judged(i));
+  const shared = judgedModels.filter((m: string, i: number) => judgedModels.indexOf(m) !== i);
+  if (shared.length > 0) {
+    return (
+      panel +
+      ` ${[...new Set(shared)].join(' and ')} holds more than one slot, so its votes count more than once. ` +
+      `Next step: set models.eval.cross_modal.slot_a, slot_b and slot_c to three different models ` +
+      `(gbrain config set models.eval.cross_modal.slot_a <model>; one provider is enough, ` +
+      `for example three claude-cli models).`
+    );
+  }
+  if (distinctProviders < 3) {
+    return panel + ` Fewer than 3 providers judged, so the panel is not cross-modal (information only).`;
+  }
+  return panel;
+}
+
 export function computeNightlyQualityProbeHealthCheck(
   probeEnabled: boolean,
-  events: ReadonlyArray<{ outcome: string; ts: string; detail?: string }>,
+  events: ReadonlyArray<{ outcome: string; ts: string; detail?: string } & ProbeJudgePanelFields>,
 ): Check {
   const name = 'nightly_quality_probe_health';
   if (!probeEnabled && events.length === 0) {
@@ -417,6 +507,7 @@ export function computeNightlyQualityProbeHealthCheck(
   const bad = events.filter(e => e.outcome !== 'pass');
   const latest = events[events.length - 1]!;
   if (bad.length > 0) {
+    const skipped = events.filter(e => e.outcome === 'skipped').length;
     const counts =
       `pass=${events.filter(e => e.outcome === 'pass').length} ` +
       `fail=${events.filter(e => e.outcome === 'fail').length} ` +
@@ -424,17 +515,18 @@ export function computeNightlyQualityProbeHealthCheck(
       `inconclusive=${events.filter(e => e.outcome === 'inconclusive').length} ` +
       `budget=${events.filter(e => e.outcome === 'budget_exceeded').length} ` +
       `no_embed_key=${events.filter(e => e.outcome === 'no_embedding_key').length} ` +
-      `rate_limited=${events.filter(e => e.outcome === 'rate_limited').length}`;
+      `rate_limited=${events.filter(e => e.outcome === 'rate_limited').length}` +
+      (skipped > 0 ? ` skipped=${skipped}` : '');
     return {
       name,
       status: 'warn',
-      message: `${bad.length} non-PASS run${bad.length === 1 ? '' : 's'} in last 7d (${counts}). Latest: ${latest.outcome} at ${latest.ts}${latest.detail ? ` (${latest.detail})` : ''}.`,
+      message: `${bad.length} non-PASS run${bad.length === 1 ? '' : 's'} in last 7d (${counts}). Latest: ${latest.outcome} at ${latest.ts}${latest.detail ? ` (${latest.detail})` : ''}.${judgePanelNote(latest)}`,
     };
   }
   return {
     name,
     status: 'ok',
-    message: `${events.length} PASS run${events.length === 1 ? '' : 's'} in last 7d. Latest: ${latest.ts}.`,
+    message: `${events.length} PASS run${events.length === 1 ? '' : 's'} in last 7d. Latest: ${latest.ts}.${judgePanelNote(latest)}`,
   };
 }
 
@@ -495,6 +587,9 @@ export async function computeConversationFactsBacklogCheck(
       }
     }
 
+    // #5330: the extractor's eligibility rule (aliases + conversation_parseable), not type alone.
+    const concreteTypes = pageTypesForAllowed(types as Parameters<typeof pageTypesForAllowed>[0]);
+    const strict = await requireParseableConversationFlag(engine);
     const rows = await engine.executeRaw<{
       backlog: string | number;
       completed: string | number;
@@ -518,7 +613,7 @@ export async function computeConversationFactsBacklogCheck(
           AND f.source_session = f.source || ':' || p.slug || ':page-' ||
             p.content_hash || '-' ||
             COALESCE(TO_CHAR(p.effective_date AT TIME ZONE 'UTC', 'YYYY-MM-DD'), 'none')
-         WHERE p.type = ANY($1::text[])
+         WHERE ${conversationFactsEligibleSql('p', '$1', strict)}
            AND p.deleted_at IS NULL
            AND COALESCE(BTRIM(p.frontmatter->>'raw_transcript'), '') = ''
            AND p.content_hash IS NOT NULL
@@ -529,7 +624,7 @@ export async function computeConversationFactsBacklogCheck(
          COALESCE(SUM(completed), 0) AS completed,
          COALESCE(SUM(CASE WHEN completed = 0 THEN non_extractable ELSE 0 END), 0) AS non_extractable
        FROM outcomes`,
-      [types],
+      [concreteTypes],
     );
 
     let backlog = Number(rows[0]?.backlog ?? 0);
@@ -545,17 +640,17 @@ export async function computeConversationFactsBacklogCheck(
     const verifierSources = await engine.executeRaw<{ source_id: string }>(
       `SELECT DISTINCT source_id
          FROM pages
-        WHERE type = ANY($1::text[])
+        WHERE ${conversationFactsEligibleSql('pages', '$1', strict)}
           AND deleted_at IS NULL
           AND (
             COALESCE(BTRIM(frontmatter->>'raw_transcript'), '') <> ''
             OR content_hash IS NULL
           )
         ORDER BY source_id`,
-      [types],
+      [concreteTypes],
     );
     for (const { source_id: sourceId } of verifierSources) {
-      for (const type of types) {
+      for (const type of concreteTypes) {
         let offset = 0;
         // eslint-disable-next-line no-constant-condition
         while (true) {
@@ -567,6 +662,7 @@ export async function computeConversationFactsBacklogCheck(
           });
           if (batch.length === 0) break;
           const verifyInProcess = batch.filter((page) => {
+            if (!isConversationFactsEligiblePage(page, concreteTypes, strict)) return false;
             const raw = page.frontmatter?.raw_transcript;
             return (typeof raw === 'string' && raw.trim().length > 0) ||
               page.content_hash == null;

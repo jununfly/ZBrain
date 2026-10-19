@@ -19,7 +19,10 @@ import {
 // drift from what search actually filters.
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../../../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../../../core/search/sql-ranking.ts';
+import { safeChunksFilter } from '../../../core/search/safe-chunks.ts';
 import type { Check } from '../../doctor.ts';
+import { checkError, doctorVerify, withSkippedSegmented } from '../check-fix.ts';
+import { pricingSetArgv } from '../../../core/budget/no-pricing.ts';
 
 // --- v0.36.1.0 calibration doctor checks (T12) ---
 
@@ -39,7 +42,7 @@ import type { Check } from '../../doctor.ts';
  *      to be re-embedded for the wrapper to apply. Paste-ready fix:
  *      `gbrain reindex --markdown`.
  *   2. Pages with contextual_retrieval_mode IS NULL — never evaluated
- *      against the CR ladder. Same fix as (1).
+ *      against the CR ladder. Fix: `gbrain repair contextual-mode` (#5621).
  *   3. Synopsis-failure events in the audit JSONL over the last 7 days
  *      — surfaces refusals + page-level fallbacks. >5% refusal rate
  *      warns; otherwise reported as informational.
@@ -49,26 +52,42 @@ import type { Check } from '../../doctor.ts';
  * `src/core/audit-synopsis.ts`. Failure-only audit means low write
  * volume on healthy brains.
  */
-export async function checkContextualRetrievalCoverage(engine: BrainEngine): Promise<Check> {
+export async function checkContextualRetrievalCoverage(
+  engine: BrainEngine,
+  // Source isolation (#4592 class): the remote report threads the caller's
+  // resolved grant here so a source-bound token never reads brain-wide
+  // page counts. Unset = brain-wide (trusted/unrestricted).
+  opts: { sourceIds?: string[] } = {},
+): Promise<Check> {
   try {
     const { MARKDOWN_CHUNKER_VERSION } = await import('../../../core/chunkers/recursive.ts');
-    const rows = await engine.executeRaw<{ chunker_drift: number; mode_null: number }>(
+    const rows = await engine.executeRaw<{ chunker_drift: number; unsealed: number; unsealed_code: number; mode_null: number }>(
       `SELECT
-         COUNT(*) FILTER (WHERE chunker_version < $1)::int AS chunker_drift,
-         COUNT(*) FILTER (WHERE contextual_retrieval_mode IS NULL)::int AS mode_null
+         COUNT(*) FILTER (WHERE page_kind = 'markdown' AND chunker_version < $1)::int AS chunker_drift,
+         -- #5004/#5247: pages of every kind the safe-chunk fence withholds from
+         -- every remote read. Counted separately from drift: the chunker version
+         -- may move past the fence floor, and only the fence has this consequence.
+         COUNT(*) FILTER (WHERE NOT (${safeChunksFilter('pages')}))::int AS unsealed,
+         COUNT(*) FILTER (WHERE page_kind = 'code' AND NOT (${safeChunksFilter('pages')}))::int AS unsealed_code,
+         -- #4009 belt+braces: extract receipts are audit artifacts stamped
+         -- mode 'none' at write time, but a reindex DB fallback can clear
+         -- the stamp — never count them as "never evaluated".
+         COUNT(*) FILTER (WHERE page_kind = 'markdown' AND contextual_retrieval_mode IS NULL AND type <> 'extract_receipt')::int AS mode_null
        FROM pages
-       WHERE page_kind = 'markdown'
-         AND deleted_at IS NULL`,
-      [MARKDOWN_CHUNKER_VERSION],
+       WHERE deleted_at IS NULL
+         ${opts.sourceIds ? 'AND source_id = ANY($2::text[])' : ''}`,
+      opts.sourceIds ? [MARKDOWN_CHUNKER_VERSION, opts.sourceIds] : [MARKDOWN_CHUNKER_VERSION],
     );
     const chunkerDrift = rows[0]?.chunker_drift ?? 0;
+    const unsealed = rows[0]?.unsealed ?? 0;
+    const unsealedCode = rows[0]?.unsealed_code ?? 0;
     const modeNull = rows[0]?.mode_null ?? 0;
 
     // Synopsis-failures audit summary (best-effort; missing audit file = 0).
     let failureSummaryLine = '';
     try {
       const audit = await import('../../../core/audit-synopsis.ts');
-      const events = audit.readRecentSynopsisFailures(7);
+      const events = audit.readRecentSynopsisFailures(7).filter((e) => !opts.sourceIds || opts.sourceIds.includes(e.source_id));
       const summary = audit.summarizeSynopsisFailures(events);
       if (summary && summary.total > 0) {
         const rate = (summary.page_level_fallback_rate * 100).toFixed(1);
@@ -80,11 +99,14 @@ export async function checkContextualRetrievalCoverage(engine: BrainEngine): Pro
       // Audit module unavailable — skip the summary line.
     }
 
-    if (chunkerDrift === 0 && modeNull === 0 && failureSummaryLine === '') {
+    const needsReindex = chunkerDrift > 0 || modeNull > 0;
+    const details = { unsealed_pages: unsealed, unsealed_code_pages: unsealedCode, mode_null_pages: modeNull, count: 'exact', repair: 'safe-chunks', mode_repair: 'contextual-mode' };
+    if (!needsReindex && unsealed === 0 && failureSummaryLine === '') {
       return {
         name: 'contextual_retrieval_coverage',
         status: 'ok',
-        message: 'All markdown pages aligned to current chunker + CR mode.',
+        message: 'All pages aligned to current chunker + CR mode.',
+        details,
       };
     }
 
@@ -92,24 +114,23 @@ export async function checkContextualRetrievalCoverage(engine: BrainEngine): Pro
     if (chunkerDrift > 0) {
       parts.push(`${chunkerDrift} page(s) at older chunker_version`);
     }
+    if (unsealed > 0) {
+      parts.push(`${unsealed} page(s) below the safe-chunk index version${unsealedCode ? ` (${unsealedCode} code)` : ''} — withheld from remote/MCP chunk retrieval until re-sealed`);
+    }
     if (modeNull > 0) {
       parts.push(`${modeNull} page(s) never evaluated against CR ladder`);
     }
-    const fixHint =
-      chunkerDrift > 0 || modeNull > 0
-        ? ` Run \`gbrain reindex --markdown\` to align.`
-        : '';
+    const fixHint = (unsealed > 0 ? ' Preview the re-seal: gbrain repair safe-chunks — apply: gbrain repair safe-chunks --apply.' : '')
+      + (modeNull > 0 ? ' Preview the mode stamp (#5621): gbrain repair contextual-mode — apply: gbrain repair contextual-mode --apply.' : '')
+      + (chunkerDrift > 0 ? ` Run \`gbrain reindex --markdown\` to align.` : '');
     return {
       name: 'contextual_retrieval_coverage',
-      status: chunkerDrift > 0 || modeNull > 0 ? 'warn' : 'ok',
+      status: needsReindex || unsealed > 0 ? 'warn' : 'ok',
       message: `${parts.join('; ')}.${fixHint}${failureSummaryLine}`,
+      details,
     };
   } catch (e) {
-    return {
-      name: 'contextual_retrieval_coverage',
-      status: 'warn',
-      message: `Could not check contextual retrieval coverage: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError('contextual_retrieval_coverage', 'check contextual retrieval coverage', e);
   }
 }
 
@@ -139,7 +160,7 @@ export async function checkContextualRetrievalCoverage(engine: BrainEngine): Pro
  * NOTE: this does NOT verify `archive/` pages are embedded/graphed — after the
  * #1777 fix `archive/` is no longer excluded, so it never appears here.
  */
-export async function checkHiddenBySearchPolicy(engine: BrainEngine): Promise<Check> {
+export async function checkHiddenBySearchPolicy(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   const name = 'hidden_by_search_policy';
   try {
     const prefixes = resolveHardExcludes();
@@ -156,14 +177,16 @@ export async function checkHiddenBySearchPolicy(engine: BrainEngine): Promise<Ch
     const filters = prefixes
       .map((_, i) => `COUNT(DISTINCT p.id) FILTER (WHERE p.slug LIKE $${i + 1} ESCAPE '\\')::int AS c${i}`)
       .join(',\n         ');
-    const params = prefixes.map((pfx) => `${escapeLikePattern(pfx)}%`);
+    const params: unknown[] = prefixes.map((pfx) => `${escapeLikePattern(pfx)}%`);
+    // A remote caller's grant confines the counts to its own sources.
+    if (opts.sourceIds) params.push(opts.sourceIds);
     const sql =
       `SELECT
          ${filters}
        FROM pages p
        JOIN sources s ON s.id = p.source_id
        WHERE EXISTS (SELECT 1 FROM content_chunks cc WHERE cc.page_id = p.id)
-         ${visibility}`;
+         ${visibility}${opts.sourceIds ? `\n         AND p.source_id = ANY($${params.length}::text[])` : ''}`;
     const rows = await engine.executeRaw<Record<string, number>>(sql, params);
     const row = rows[0] ?? {};
 
@@ -195,11 +218,7 @@ export async function checkHiddenBySearchPolicy(engine: BrainEngine): Promise<Ch
       details: { prefixes, counts },
     };
   } catch (e) {
-    return {
-      name,
-      status: 'warn',
-      message: `Could not check hidden-by-search-policy: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError(name, 'check hidden-by-search-policy', e);
   }
 }
 
@@ -221,13 +240,24 @@ export async function checkHiddenBySearchPolicy(engine: BrainEngine): Promise<Ch
 export async function checkLinkResolutionOpportunity(
   engine: BrainEngine,
   progress?: ProgressReporter,
+  opts: { sourceIds?: string[] } = {},
 ): Promise<Check> {
   const name = 'link_resolution_opportunity';
   try {
     if (await isGlobalBasenameEnabled(engine)) {
       return { name, status: 'ok', message: 'global_basename mode already enabled' };
     }
-    const allSlugs = await engine.getAllSlugs();
+    // A remote caller's grant confines the slug index, the page total and the
+    // scanned sample to its own sources.
+    let allSlugs: Set<string>;
+    if (opts.sourceIds) {
+      allSlugs = new Set();
+      for (const sourceId of opts.sourceIds) for (const slug of await engine.getAllSlugs({ sourceId })) allSlugs.add(slug);
+    } else {
+      allSlugs = await engine.getAllSlugs();
+    }
+    const scope = opts.sourceIds ? ' AND source_id = ANY($1::text[])' : '';
+    const scopeParams = opts.sourceIds ? [opts.sourceIds] : undefined;
     if (allSlugs.size === 0) {
       return { name, status: 'ok', message: 'Brain is empty — nothing to scan' };
     }
@@ -247,8 +277,15 @@ export async function checkLinkResolutionOpportunity(
     // returned a perpetual partial; this bounds the work to a fixed sample.
     const SAMPLE_LIMIT = 1000;
     const sampled = await engine.executeRaw<{ compiled_truth: string | null; timeline: string | null }>(
-      `SELECT compiled_truth, timeline FROM pages WHERE deleted_at IS NULL ORDER BY id DESC LIMIT ${SAMPLE_LIMIT}`,
+      `SELECT compiled_truth, timeline FROM pages WHERE deleted_at IS NULL${scope} ORDER BY id DESC LIMIT ${SAMPLE_LIMIT}`,
+      scopeParams,
     );
+    // Decision #10: a segmented page's body columns are NULL, so the sample scans it as an empty body.
+    const [segmented] = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM (SELECT body_storage FROM pages WHERE deleted_at IS NULL${scope} ORDER BY id DESC LIMIT ${SAMPLE_LIMIT}) s WHERE s.body_storage = 'segmented'`,
+      scopeParams,
+    ).catch(() => []);
+    const result = (check: Check) => withSkippedSegmented(check, Number(segmented?.n ?? 0));
     const totalPages = allSlugs.size;
     const sampledNote = totalPages > SAMPLE_LIMIT
       ? ` (scanned the ${SAMPLE_LIMIT} most-recent of ${totalPages} pages)`
@@ -277,33 +314,33 @@ export async function checkLinkResolutionOpportunity(
     }
 
     if (bareCount === 0) {
-      return { name, status: 'ok', message: 'No bare wikilinks found' };
+      return result({ name, status: 'ok', message: 'No bare wikilinks found' });
     }
     if (wouldResolveCount === 0) {
-      return {
+      return result({
         name,
         status: 'ok',
         message: `${bareCount} bare wikilink(s) found, but none have basename matches in the brain.`,
-      };
+      });
     }
     const ratio = wouldResolveCount / bareCount;
     if (wouldResolveCount >= 5 && ratio >= 0.20) {
       const pct = Math.round(ratio * 100);
-      return {
+      return result({
         name,
         status: 'warn',
         message:
           `${wouldResolveCount} of ${bareCount} bare wikilinks (${pct}%) would resolve to ` +
           `${distinctTargets.size} distinct page(s) under global_basename mode${sampledNote}. ` +
           `Enable with: gbrain config set link_resolution.global_basename true`,
-      };
+      });
     }
     const pct = Math.round(ratio * 100);
-    return {
+    return result({
       name,
       status: 'ok',
       message: `${wouldResolveCount}/${bareCount} bare wikilinks (${pct}%) would resolve — below the 20% / 5-link threshold for surfacing a hint${sampledNote}.`,
-    };
+    });
   } catch (e) {
     return {
       name,
@@ -313,16 +350,25 @@ export async function checkLinkResolutionOpportunity(
   }
 }
 
-export async function checkAbandonedThreads(engine: BrainEngine): Promise<Check> {
+export async function checkAbandonedThreads(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
+    // A remote caller's grant counts only takes on its own sources' pages.
     const rows = await engine.executeRaw<{ count: number }>(
+      // since_date is TEXT and may be month-precision ('YYYY-MM'); 'YYYY-MM'::date
+      // throws "invalid input syntax for type date", so normalize to the 1st
+      // before casting — same guarded cast as the detail query in serve-http.ts
+      // (`gbrain calibration` abandoned-threads), which must stay in lockstep so
+      // the doctor count matches the listing it points users at.
       `SELECT COUNT(*)::int AS count FROM takes
          WHERE active = true
            AND resolved_at IS NULL
            AND superseded_by IS NULL
            AND weight >= 0.7
            AND since_date IS NOT NULL
-           AND since_date::date < (now() - INTERVAL '12 months')`,
+           AND (since_date || CASE WHEN length(since_date) = 7 THEN '-01' ELSE '' END)::date
+               < (now() - INTERVAL '12 months')` +
+        (opts.sourceIds ? `\n           AND page_id IN (SELECT id FROM pages WHERE source_id = ANY($1::text[]))` : ''),
+      opts.sourceIds ? [opts.sourceIds] : undefined,
     );
     const count = rows[0]?.count ?? 0;
     if (count === 0) {
@@ -338,11 +384,7 @@ export async function checkAbandonedThreads(engine: BrainEngine): Promise<Check>
       message: `${count} high-conviction take(s) older than 12 months and never revisited — see \`gbrain calibration\` for details`,
     };
   } catch (e) {
-    return {
-      name: 'abandoned_threads',
-      status: 'warn',
-      message: `Could not check abandoned threads: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError('abandoned_threads', 'check abandoned threads', e);
   }
 }
 
@@ -353,14 +395,15 @@ export async function checkAbandonedThreads(engine: BrainEngine): Promise<Check>
  * brains see one row per source; this check uses the most recent across
  * all sources.
  */
-export async function checkCalibrationFreshness(engine: BrainEngine): Promise<Check> {
+export async function checkCalibrationFreshness(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
     const ownerHolder = resolveOwnerHolder({
       configValue: await engine.getConfig('emotional_weight.user_holder'),
     });
+    // A remote caller's grant reads only its own sources' profiles.
     const rows = await engine.executeRaw<{ generated_at: Date | null }>(
-      `SELECT MAX(generated_at) AS generated_at FROM calibration_profiles WHERE holder = $1`,
-      [ownerHolder],
+      `SELECT MAX(generated_at) AS generated_at FROM calibration_profiles WHERE holder = $1${opts.sourceIds ? ' AND source_id = ANY($2::text[])' : ''}`,
+      opts.sourceIds ? [ownerHolder, opts.sourceIds] : [ownerHolder],
     );
     const generated = rows[0]?.generated_at;
     if (!generated) {
@@ -386,11 +429,7 @@ export async function checkCalibrationFreshness(engine: BrainEngine): Promise<Ch
       message: `Calibration profile generated ${ageDays}d ago`,
     };
   } catch (e) {
-    return {
-      name: 'calibration_freshness',
-      status: 'warn',
-      message: `Could not check calibration freshness: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError('calibration_freshness', 'check calibration freshness', e);
   }
 }
 
@@ -406,10 +445,15 @@ export async function checkCalibrationFreshness(engine: BrainEngine): Promise<Ch
  * exists so the surface is wired; the math arrives once we have N >= 30
  * auto-applied verdicts to compare.
  */
-export async function checkGradeConfidenceDrift(engine: BrainEngine): Promise<Check> {
+export async function checkGradeConfidenceDrift(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
+    // A remote caller's grant counts only verdicts on takes of its own sources' pages.
     const rows = await engine.executeRaw<{ applied_count: number }>(
-      `SELECT COUNT(*)::int AS applied_count FROM take_grade_cache WHERE applied = true`,
+      `SELECT COUNT(*)::int AS applied_count FROM take_grade_cache WHERE applied = true` +
+        (opts.sourceIds
+          ? ' AND take_id IN (SELECT t.id FROM takes t JOIN pages p ON p.id = t.page_id WHERE p.source_id = ANY($1::text[]))'
+          : ''),
+      opts.sourceIds ? [opts.sourceIds] : undefined,
     );
     const applied = rows[0]?.applied_count ?? 0;
     if (applied < 30) {
@@ -430,11 +474,7 @@ export async function checkGradeConfidenceDrift(engine: BrainEngine): Promise<Ch
       message: `${applied} auto-applied verdicts; drift math arrives in v0.37+`,
     };
   } catch (e) {
-    return {
-      name: 'grade_confidence_drift',
-      status: 'warn',
-      message: `Could not check grade confidence drift: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError('grade_confidence_drift', 'check grade confidence drift', e);
   }
 }
 
@@ -515,13 +555,15 @@ export async function checkSubagentHealth(engine: BrainEngine): Promise<Check> {
   }
 }
 
-export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> {
+export async function checkVoiceGateHealth(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
+    // A remote caller's grant reads only its own sources' profiles.
     const rows = await engine.executeRaw<{ total: number; failures: number }>(
       `SELECT COUNT(*)::int AS total,
               COALESCE(SUM(CASE WHEN voice_gate_passed = false THEN 1 ELSE 0 END), 0)::int AS failures
          FROM calibration_profiles
-         WHERE generated_at >= (now() - INTERVAL '7 days')`,
+         WHERE generated_at >= (now() - INTERVAL '7 days')${opts.sourceIds ? ' AND source_id = ANY($1::text[])' : ''}`,
+      opts.sourceIds ? [opts.sourceIds] : undefined,
     );
     const total = rows[0]?.total ?? 0;
     const failures = rows[0]?.failures ?? 0;
@@ -537,7 +579,8 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
       return {
         name: 'voice_gate_health',
         status: 'warn',
-        message: `Voice gate failed ${failures}/${total} (${Math.round(failRate * 100)}%) in last 7 days. Review src/core/calibration/voice-gate.ts rubric.`,
+        message: `Voice gate failed ${failures}/${total} (${Math.round(failRate * 100)}%) in last 7 days: the calibration voice gate rejects most generated profiles. That is a gbrain quality issue, not something to change locally; report it with \`gbrain doctor --json\` output.`,
+        fix_unavailable_reason: 'operator_judgement',
       };
     }
     return {
@@ -546,47 +589,88 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
       message: `Voice gate ${failures}/${total} failed in last 7 days (${Math.round(failRate * 100)}%)`,
     };
   } catch (e) {
-    return {
-      name: 'voice_gate_health',
-      status: 'warn',
-      message: `Could not check voice gate health: ${e instanceof Error ? e.message : String(e)}`,
-    };
+    return checkError('voice_gate_health', 'check voice gate health', e);
   }
 }
 
-/**
- * v0.35.0.0+ reranker_health doctor check.
- *
- * Logic (post-CDX2 review):
- *   1) Read `search.reranker.enabled` first. When disabled and no
- *      failures in window → 'ok: reranker disabled'. Avoids interpreting
- *      "no events" as "broken" when reranker is simply not in use.
- *   2) Walk last 7 days of `~/.gbrain/audit/rerank-failures-*.jsonl`.
- *   3) Auth failures: ANY single one warns (config-time problem doctor's
- *      own probe should have caught — surface it).
- *   4) Transient (network/timeout/rate_limit): warn at >=5 in window.
- *      Below that they're noise; reranker fails open anyway.
- *   5) Payload-too-large failures: warn at >=1 (indicates a workload
- *      mismatch that the operator should know about).
- *   6) Budget/pricing failures: warn at >=1 with the rerank pricing surface
- *      and --max-cost escape hatch.
- *
- * Engine-agnostic (file-based + one config-key read).
- */
-export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
+export async function checkRerankerHealth(engine: BrainEngine, now: Date = new Date()): Promise<Check> {
   try {
     const { readRecentRerankFailures } = await import('../../../core/rerank-audit.ts');
-    const cfg = await engine.getConfig('search.reranker.enabled');
-    const rerankerEnabled = cfg === 'true' || cfg === '1';
+    const { loadSearchModeConfig, resolveSearchMode } = await import('../../../core/search/mode.ts');
+    const { describeRerankerFix } = await import('../../../core/ai/reranker-readiness.ts');
+    const { rerankerReadinessForEngine } = await import('../../../core/ai/reranker-readiness-engine.ts');
+    // v0.48.2: resolve enablement + model through the SAME plane search
+    // reranks with (per-key config → mode bundle), not the raw
+    // `search.reranker.enabled` row — balanced/tokenmax enable the reranker
+    // with no row at all, and the default model is keyed on VOYAGE_API_KEY.
+    const knobs = resolveSearchMode(await loadSearchModeConfig(engine));
+    const rerankerEnabled = knobs.reranker_enabled;
+    const model = knobs.reranker_model;
+    // Same config plane the CLI hands the gateway (env > file > DB-plane
+    // provider keys + provider_base_urls) — shared with `gbrain search modes`
+    // through rerankerReadinessForEngine so the two surfaces cannot drift.
+    const { readiness } = await rerankerReadinessForEngine(engine, model);
+    const ready = readiness.ready;
 
-    const failures = readRecentRerankFailures(7);
+    // A brain with NO embedding provider never reaches the reranker (search
+    // takes the keyword-only path), so a missing reranker key is not a fault
+    // there. Only judged when the gateway is configured; unknown → no suppress.
+    let embeddingUp = true;
+    try {
+      const gw = await import('../../../core/ai/gateway.ts');
+      gw.requireConfig();
+      embeddingUp = gw.isAvailable('embedding');
+    } catch { embeddingUp = true; }
+    if (rerankerEnabled && !ready && !embeddingUp) {
+      return {
+        name: 'reranker_health',
+        status: 'ok',
+        message: `Reranker ${model} is enabled but this brain has no embedding provider, so search runs keyword-only and the reranker never fires — nothing to fix until embeddings are configured.`,
+      };
+    }
+
+    if (rerankerEnabled && !ready) {
+      // Config-time problem: every search falls through unreranked in
+      // silence (one audit row per process, no stderr). Name the fix.
+      return {
+        name: 'reranker_health',
+        status: 'warn',
+        message: `Reranker ${model} is enabled but not running — ${describeRerankerFix(readiness)}`,
+      };
+    }
+
+    if (!rerankerEnabled) {
+      // Disabled: historical rows (often for a retired default) must not warn.
+      return {
+        name: 'reranker_health',
+        status: 'ok',
+        message: `Reranker disabled — no failures expected` +
+          (readiness.ready && knobs.resolved_mode !== 'conservative'
+            ? ` (${model} is ready: gbrain config set search.reranker.enabled true)`
+            : ''),
+      };
+    }
+    const allRows = readRecentRerankFailures(7).filter((f) => f.model === model);
+    const skipRows = allRows.filter((f) => f.reason === 'no_key');
+    const failures = allRows.filter((f) => f.reason !== 'no_key');
+    const readyNote = `Reranker ${model} ready${readiness.requiredKey ? ` (${readiness.requiredKey} present)` : ''}`;
+    if (rerankerEnabled && skipRows.length > 0 && failures.length === 0) {
+      const reasons = Array.from(new Set(skipRows.map((f) => f.reason))).join(', ');
+      return {
+        name: 'reranker_health',
+        status: 'ok',
+        message:
+          `${readyNote} — ${skipRows.length} skip row(s) in last 7 days (${reasons}): searches in those processes ran unreranked ` +
+          `(a long-lived worker started before the key was added keeps skipping until it reloads its env; cached result sets ` +
+          `written while skipped stay unreranked for up to cache.ttl_seconds).`,
+      };
+    }
+
     if (failures.length === 0) {
       return {
         name: 'reranker_health',
         status: 'ok',
-        message: rerankerEnabled
-          ? 'No rerank failures in last 7 days'
-          : 'Reranker disabled — no failures expected',
+        message: `${readyNote} — No rerank failures in last 7 days`,
       };
     }
 
@@ -595,7 +679,10 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       return {
         name: 'reranker_health',
         status: 'warn',
-        message: `${authFails.length} reranker auth failure(s) in last 7 days. Fix: verify the reranker provider's API key (e.g. VOYAGE_API_KEY) and run \`gbrain models doctor\`.`,
+        // #5432: the audit log records failures only and this check runs no
+        // live probe, so it reports history, not the key's current state.
+        message: `${authFails.length} reranker auth failure(s) recorded in the last 7 days (key present but rejected at the time). This is audit-log history; no live probe was run, so the key may have recovered since. Fix: verify the reranker provider's API key (e.g. ${readiness.requiredKey ?? 'VOYAGE_API_KEY'}) and run \`gbrain models doctor\`.`,
+        details: { live_probe_performed: false, failures_recorded: authFails.length, window_days: 7 },
       };
     }
 
@@ -613,7 +700,27 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       return {
         name: 'reranker_health',
         status: 'warn',
-        message: `${budgetFails.length} reranker budget/pricing failure(s) in last 7 days. Fix: add rerank pricing to src/core/embedding-pricing.ts or drop --max-cost.`,
+        message: `${budgetFails.length} reranker budget/pricing failure(s) in last 7 days: ${model} has no registered price, so capped searches skip reranking. Register its per-token rate (look it up on the provider's pricing page) or drop --max-cost.`,
+        fix: {
+          argv: pricingSetArgv(model, 'rerank'), consent: [], actor: 'agent', requires_exclusive: false,
+          why: `Registers ${model}'s price so spend caps can account for reranking.`,
+          inputs: [
+            { name: 'usd-per-1M-tokens', how: `Look up ${model}'s price per 1M tokens on the provider's pricing page (for example by web search).` },
+            { name: 'pricing-page-url', how: 'The URL you read the price from.' },
+          ],
+          verify: doctorVerify('reranker_health'),
+        },
+      };
+    }
+
+    // Cat 40 R0: no HTTP response at all is a configuration or network fault
+    // (a stale base URL fails every call), not a provider outage.
+    const unreachableFails = failures.filter((f) => f.reason === 'unreachable');
+    if (unreachableFails.length >= 3) {
+      return {
+        name: 'reranker_health',
+        status: 'warn',
+        message: `${unreachableFails.length} reranker call(s) in the last 7 days could not reach the ${model} endpoint (connection refused, DNS or network error), so those searches kept their fused order. Fix: check the reranker base URL (\`provider_base_urls.${model.split(':')[0]}\` in the gbrain config, or the provider default) and that the brain host can reach it, then run \`gbrain models doctor\`.`,
       };
     }
 
@@ -624,7 +731,22 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       return {
         name: 'reranker_health',
         status: 'warn',
-        message: `${transientFails.length} transient reranker failure(s) in last 7 days. Search fails open to RRF order; check ZE status if persistent.`,
+        message: `${transientFails.length} transient reranker failure(s) in last 7 days. Search fails open to RRF order; check the provider's status page if persistent.`,
+      };
+    }
+
+    // #4648: success-shaped pass-throughs — the provider answered 200 with an
+    // empty/malformed result set, so searches returned raw RRF order with no
+    // rerank_score. The reranker "runs" (logs grow, latency paid) but has
+    // zero effect; the response-shape mismatch is the usual culprit.
+    const passThroughFails = failures.filter(
+      (f) => f.reason === 'empty_result_set' || f.reason === 'malformed_shape',
+    );
+    if (passThroughFails.length >= 3) {
+      return {
+        name: 'reranker_health',
+        status: 'warn',
+        message: `${passThroughFails.length} reranker empty/malformed-response pass-through(s) in last 7 days — those searches returned raw RRF order unscored. Fix: verify the rerank endpoint answers {results:[{index, relevance_score}]} for a non-empty documents array (check \`search.reranker.model\` and the endpoint's response shape).`,
       };
     }
 
@@ -636,7 +758,6 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
       const setupHint = unknownFails.some((f) => {
         const summary = String(f.error_summary ?? '');
         return (
-          summary.includes('ZEROENTROPY_API_KEY') ||
           summary.includes('VOYAGE_API_KEY') ||
           summary.toLowerCase().includes('api key')
         );
@@ -657,11 +778,6 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return {
-      name: 'reranker_health',
-      status: 'warn',
-      message: `Could not check reranker audit: ${msg}`,
-    };
+    return checkError('reranker_health', 'check reranker audit', msg);
   }
 }
-

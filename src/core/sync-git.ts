@@ -3,12 +3,15 @@
  * baseline-commit self-heal, and path-containment guards. Peeled out of
  * src/commands/sync.ts (containment sprint C13-C14) as a pure move.
  */
-import { existsSync, readFileSync, realpathSync } from 'fs';
-import { execFileSync } from 'child_process';
-import { isAbsolute, join, relative, sep } from 'path';
+import { lstatSync, realpathSync } from 'fs';
+import { execFileSync } from './spawn.ts';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
-import { resolveSlugForPath } from './sync.ts';
-import { loadStorageConfig } from './storage-config.ts';
+import { resolveSlugForPath, DEFAULT_SOURCE_ID } from './sync.ts';
+import { DELETE_BATCH_SIZE } from './engine-constants.ts';
+import { invalidateGitListingCache, knownOutsideGitRepo, noteGitFailure } from './git-visible-files.ts';
+import { hasUnresolvedDbOnlyDeclaration, loadStorageConfig } from './storage-config.ts';
+import { GIT_READ_ENV, gitChildEnv } from './git-env.ts';
 
 /**
  * v0.32.7 CJK wave (codex post-merge F4): resolve a slug by `pages.source_path`
@@ -28,30 +31,216 @@ export async function resolveSlugByPathOrSourcePath(
   path: string,
   sourceId?: string,
 ): Promise<string> {
-  // v0.41.19.0 (D8): when sourceId is set, delegate to the new batch
-  // resolveSlugsByPaths so single-call and batched paths share one SQL
-  // owner + one fallback semantic. One Map allocation per single-call;
-  // negligible cost. When sourceId is undefined (legacy unscoped callers),
-  // fall back to the original executeRaw shape — the batch method
-  // requires sourceId to prevent the multi-source-bug-class on its new
-  // surface (D5). The unscoped fallback preserves back-compat.
+  // v0.41.19.0 (D8): the batch resolveSlugsByPaths is the one SQL owner and
+  // fallback semantic (#6948: the canonical page of the path, never an
+  // arbitrary twin). #3583 gate14: without a sourceId it is scoped to
+  // 'default', matching every WRITE the bare no-sourceId path performs
+  // (updateSlug, deletePage, the rename bookkeeping repair), so resolve and
+  // mutate agree on the scope.
   try {
-    if (sourceId) {
-      const m = await engine.resolveSlugsByPaths([path], { sourceId });
-      const slug = m.get(path);
-      if (slug) return slug;
-    } else {
-      const rows = await engine.executeRaw<{ slug: string }>(
-        `SELECT slug FROM pages WHERE source_path = $1 LIMIT 1`,
-        [path],
-      );
-      if (rows.length > 0 && rows[0].slug) return rows[0].slug;
-    }
+    const slug = (await engine.resolveSlugsByPaths([path], { sourceId: sourceId ?? DEFAULT_SOURCE_ID })).get(path);
+    if (slug) return slug;
   } catch {
     // Fall through — best-effort. Pre-migration brains or query errors
     // shouldn't break delete/rename for path-derived pages.
   }
   return resolveSlugForPath(path);
+}
+
+/** #3942: a fallback resolution refused because the derived slug belongs to a different file. */
+export interface RefusedSlugResolution {
+  /** The removed file path the caller asked about. */
+  path: string;
+  /** The re-slugified slug that path derived to. */
+  slug: string;
+  /** The DIFFERENT file the page at that slug records as its origin. */
+  originPath: string;
+  /** #6948: several live pages record the removed path and none is its canonical page; none is touched. */
+  claimants?: string[];
+}
+
+export interface RemovedPathSlugResolution {
+  /** path → slug that is safe to act on (delete / rename-from). */
+  slugs: Map<string, string>;
+  /** Foreign-origin fallbacks the caller must skip (and should log). */
+  refused: RefusedSlugResolution[];
+}
+
+/** Separator-normalize for source_path comparisons (mirrors sync-reconcile.ts). */
+function normalizeOriginPath(p: string): string {
+  return p.replace(/\\/g, '/');
+}
+
+/** One-line operator warning for a refused resolution (#3942). */
+export function refusedRemovedPathMessage(r: RefusedSlugResolution): string {
+  if (r.claimants) {
+    return `  [sync] refusing to delete a page for removed path '${r.path}': ${r.claimants.join(', ')} all record it as their origin (preview gbrain repair origin-twins to choose the page that keeps it).`;
+  }
+  return (
+    `  [sync] refusing to touch '${r.slug}' for removed path '${r.path}': ` +
+    `that page originates from '${r.originPath}' (#3942 — re-slugified paths ` +
+    `can collide; remove the page directly if you really meant it).`
+  );
+}
+
+/**
+ * #3942 — THE delete-side slug resolver. Every sync lane that turns a
+ * REMOVED file path into a slug to delete (or rename away from) routes
+ * through here, so the delete side can never act on a re-slugified
+ * approximation that names a different file's page.
+ *
+ * Two phases:
+ *
+ *  1. Exact `source_path` match — the import side's own record (the same
+ *     derivation that wrote the row). Scoped via `resolveSlugsByPaths` when
+ *     `sourceId` is set; the legacy unscoped shape otherwise.
+ *  2. Path-derived fallback (`resolveSlugForPath`, identical to the import
+ *     side's `slugifyPath` dispatch) — but VERIFIED before use:
+ *     `slugifySegment` strips trailing hyphens (among other lossy rewrites),
+ *     so `extracts/propose-/x.md` and `extracts/propose/x.md` derive the SAME
+ *     slug. Verification inspects ALL live rows at the derived slug (the
+ *     unscoped lane can see one per source): if every one records a DIFFERENT
+ *     origin file, the resolution is REFUSED (returned in `refused`, absent
+ *     from `slugs`) instead of silently deleting a page whose own file is
+ *     untouched; any row whose origin IS the removed path allows it. Pages
+ *     with a NULL `source_path` (legacy pre-source_path imports) and slugs
+ *     with no live row at all (no-op deletes) keep today's fallback behavior;
+ *     soft-deleted rows are ignored on both phases.
+ *
+ * Fail-open on lookup errors (pre-migration schemas): a failed verification
+ * query preserves the legacy fallback rather than wedging deletes — matching
+ * the long-standing best-effort posture of `resolveSlugByPathOrSourcePath`.
+ */
+export async function resolveSlugsForRemovedPaths(
+  engine: BrainEngine,
+  paths: string[],
+  sourceId: string | undefined,
+): Promise<RemovedPathSlugResolution> {
+  const slugs = new Map<string, string>();
+  const refused: RefusedSlugResolution[] = [];
+  if (paths.length === 0) return { slugs, refused };
+
+  // Phase 1: exact source_path → slug (chunked to the engine batch cap).
+  const exact = new Map<string, string>();
+  if (sourceId !== undefined) {
+    for (let i = 0; i < paths.length; i += DELETE_BATCH_SIZE) {
+      try {
+        const m = await engine.resolveSlugsByPaths(paths.slice(i, i + DELETE_BATCH_SIZE), { sourceId });
+        for (const [p, s] of m) exact.set(p, s);
+      } catch {
+        // Best-effort — fall through to the verified phase-2 fallback.
+      }
+    }
+  } else {
+    for (const p of paths) {
+      try {
+        // Unscoped lane: only LIVE rows may drive resolution (a soft-deleted
+        // row's record must not name a slug for the delete side to act on),
+        // and the pick is ORDER BY-deterministic when a multi-source brain
+        // holds several rows for the same source_path.
+        const rows = await engine.executeRaw<{ slug: string }>(
+          `SELECT slug FROM pages WHERE source_path = $1 AND deleted_at IS NULL
+            ORDER BY source_id, slug LIMIT 1`,
+          [p],
+        );
+        if (rows.length > 0 && rows[0].slug) exact.set(p, rows[0].slug);
+      } catch {
+        // Best-effort.
+      }
+    }
+  }
+
+  const twins = new Map<string, string[]>();
+  const unresolved = paths.filter(p => !exact.has(p));
+  for (let i = 0; sourceId !== undefined && i < unresolved.length; i += DELETE_BATCH_SIZE) {
+    try {
+      const rows = await engine.executeRaw<{ source_path: string; slugs: string[] }>(`SELECT source_path, array_agg(slug ORDER BY slug) AS slugs FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL AND source_path = ANY($2::text[]) GROUP BY source_path HAVING count(*) > 1`, [sourceId, unresolved.slice(i, i + DELETE_BATCH_SIZE)]);
+      for (const row of rows) twins.set(row.source_path, row.slugs);
+    } catch {
+      // Best-effort, like phase 1.
+    }
+  }
+  const fallbacks: Array<{ path: string; slug: string }> = [];
+  for (const p of paths) {
+    const claimants = twins.get(p);
+    if (claimants) { refused.push({ path: p, slug: claimants[0]!, originPath: p, claimants }); continue; }
+    const hit = exact.get(p);
+    if (hit !== undefined) slugs.set(p, hit);
+    else fallbacks.push({ path: p, slug: resolveSlugForPath(p) });
+  }
+  if (fallbacks.length === 0) return { slugs, refused };
+
+  // Phase 2: verify each derived slug's recorded origin before trusting it.
+  // Per-item placeholders (not ANY(array)) so the same executeRaw shape binds
+  // identically on both engines — a query error here fails OPEN, which would
+  // silently disable the guard, so the boring portable form wins.
+  //
+  // Collect ALL live rows per slug: the unscoped lane can see one row per
+  // source at the same slug, and a single-value (last-row-wins) map made
+  // refuse-vs-allow depend on engine row order. `deleted_at IS NULL` keeps
+  // soft-deleted rows from vetoing (or licensing) a delete, and the ORDER BY
+  // makes the reported refusal origin deterministic. The scoped lane has at
+  // most one live row per slug, so its behavior is unchanged.
+  const originsBySlug = new Map<string, Array<string | null>>();
+  for (let i = 0; i < fallbacks.length; i += DELETE_BATCH_SIZE) {
+    const chunk = fallbacks.slice(i, i + DELETE_BATCH_SIZE).map(f => f.slug);
+    try {
+      const params: unknown[] = [...chunk];
+      const placeholders = chunk.map((_, j) => `$${j + 1}`).join(', ');
+      let where = `slug IN (${placeholders}) AND deleted_at IS NULL`;
+      if (sourceId !== undefined) {
+        params.push(sourceId);
+        where += ` AND source_id = $${params.length}`;
+      }
+      const rows = await engine.executeRaw<{ slug: string; source_path: string | null }>(
+        `SELECT slug, source_path FROM pages WHERE ${where} ORDER BY source_id, slug`,
+        params,
+      );
+      for (const r of rows) {
+        const list = originsBySlug.get(r.slug);
+        if (list) list.push(r.source_path);
+        else originsBySlug.set(r.slug, [r.source_path]);
+      }
+    } catch {
+      // Fail-open: without origin evidence, keep the legacy fallback.
+    }
+  }
+  for (const f of fallbacks) {
+    const origins = originsBySlug.get(f.slug) ?? [];
+    // Allow when: no live row at the slug (harmless no-op delete), any legacy
+    // NULL-origin row (pre-source_path brains keep today's fallback), or ANY
+    // live row that records the removed path itself as its origin. Refuse
+    // only when every live row positively names a DIFFERENT origin file.
+    const anyNullOrigin = origins.some(o => o == null);
+    const anyMatch = origins.some(
+      o => o != null && normalizeOriginPath(o) === normalizeOriginPath(f.path),
+    );
+    if (origins.length > 0 && !anyNullOrigin && !anyMatch) {
+      // All origins are non-null mismatches; origins[0] is source_id-ordered,
+      // so the reported path is deterministic.
+      refused.push({ path: f.path, slug: f.slug, originPath: origins[0] as string });
+    } else {
+      slugs.set(f.path, f.slug);
+    }
+  }
+  return { slugs, refused };
+}
+
+/**
+ * Single-path convenience over `resolveSlugsForRemovedPaths` for the per-path
+ * sync lanes. Logs any refusal through `warn` and returns undefined so the
+ * caller skips the destructive action (#3942).
+ */
+export async function resolveRemovedPathSlug(
+  engine: BrainEngine,
+  path: string,
+  sourceId: string | undefined,
+  warn: (msg: string) => void,
+): Promise<string | undefined> {
+  const res = await resolveSlugsForRemovedPaths(engine, [path], sourceId);
+  for (const r of res.refused) warn(refusedRemovedPathMessage(r));
+  return res.slugs.get(path);
 }
 
 /**
@@ -93,6 +282,19 @@ export function resolveNoEmbed(
   return args.includes('--no-embed') || cfg?.embedding_disabled === true;
 }
 
+/** Subcommands that never change a repository; any other one drops the doctor-run git memo (git-visible-files.ts). */
+const READ_ONLY_GIT = new Set(['rev-parse', 'ls-files', 'ls-tree', 'cat-file', 'diff', 'log', 'show', 'status', 'rev-list', 'merge-base',
+  'for-each-ref', 'show-ref', 'describe', 'check-ignore', 'name-rev', 'blame', 'grep', 'check-attr', 'var', 'version']);
+
+function noteGitCommand(args: string[]): void {
+  if (!READ_ONLY_GIT.has(args[0] ?? '')) invalidateGitListingCache();
+}
+
+/** `GIT_READ_ENV` for a read-only subcommand (no optional index lock), nothing for one that writes. */
+function readOnlyEnv(args: string[]): NodeJS.ProcessEnv {
+  return READ_ONLY_GIT.has(args[0] ?? '') ? GIT_READ_ENV : {};
+}
+
 /**
  * Shell out to git with a generous maxBuffer.
  *
@@ -119,12 +321,31 @@ export function git(
   timeoutMs = 30000,
   { silenceStderr = false }: { silenceStderr?: boolean } = {},
 ): string {
+  noteGitCommand(args);
   return execFileSync('git', buildGitInvocation(repoPath, args, configs), {
+    env: gitChildEnv(readOnlyEnv(args)),
     encoding: 'utf-8',
     timeout: timeoutMs,
     maxBuffer: 100 * 1024 * 1024,
     ...(silenceStderr ? { stdio: ['ignore', 'pipe', 'pipe'] as const } : {}),
   }).trim();
+}
+
+/**
+ * git() minus the trim — REQUIRED for NUL-delimited listings (`ls-files -z`,
+ * `ls-tree -z`): a filename that begins with a space is the FIRST entry of
+ * the listing, and trim() silently rewrites it into a different path (#3583
+ * review — the misread let a decoy blob stand in for the real file and a
+ * live page was deleted on the corrupted evidence).
+ */
+export function gitRawOutput(repoPath: string, args: string[]): string {
+  noteGitCommand(args);
+  return execFileSync('git', buildGitInvocation(repoPath, args, []), {
+    env: gitChildEnv(readOnlyEnv(args)),
+    encoding: 'utf-8',
+    timeout: 30000,
+    maxBuffer: 100 * 1024 * 1024,
+  });
 }
 
 /**
@@ -144,8 +365,10 @@ export function git(
  */
 export function discoverGitRoot(inputPath: string): string {
   try {
+    if (knownOutsideGitRepo(inputPath)) throw new Error('outside a git repository');
     return git(inputPath, ['rev-parse', '--show-toplevel'], [], 30000, { silenceStderr: true });
-  } catch {
+  } catch (error) {
+    noteGitFailure(inputPath, error);
     throw new Error(
       `Not inside a git repository: ${inputPath}. GBrain sync requires a git-initialized repo (or a subdirectory of one).`,
     );
@@ -269,46 +492,21 @@ export function createSyncBaselineCommit(repoPath: string): void {
   const dbOnlyDirs = storageConfig?.db_only ?? [];
   // Sniff-test fail-closed (round 6, P2): `loadStorageConfig` warns-and-
   // returns an EMPTY config for syntactically-valid-but-unsupported YAML
-  // (e.g. flow-style `db_only: [dir/]` — the narrow custom parser only
+  // (e.g. flow-style `db_only: [dir/]`; the narrow custom parser only
   // handles block-style lists), which would silently resolve zero
-  // exclusions from a file that clearly intended some. If gbrain.yml
-  // exists and mentions db_only (or its deprecated pre-v0.22.11 alias
-  // `supabase_only` — same keep-out-of-git semantics, still a supported
-  // backward-compat key per storage-config.ts) but nothing resolved from
-  // it, refuse rather than guess "genuinely empty" vs "syntax ignored".
-  //
-  // Known false-positive (round 8 review): a genuinely, intentionally
-  // empty `db_only: []` mentioning the word also refuses, and can't be
-  // told apart from the unsupported-syntax case — `loadStorageConfig`
-  // returns the IDENTICAL `{db_tracked:[],db_only:[]}` for both (verified
-  // directly: flow-style `[dir/]` and literal `[]` both collapse to that
-  // same shape). Distinguishing them would mean teaching this function
-  // about the parser's internal line-recognition rules, which belongs in
-  // storage-config.ts, not here. Accepted trade-off: the false-positive
-  // cost is low and self-resolving (the brain stays wedged with a clear,
-  // actionable error until the user drops the pointless empty stanza or
-  // fixes their syntax; retried on every subsequent sync); the
-  // false-negative this guards against — silently committing db_only
-  // content into permanent git history — is high-cost and hard to undo.
-  if (dbOnlyDirs.length === 0) {
+  // exclusions from a file that clearly intended some. If gbrain.yml has a
+  // db_only (or deprecated `supabase_only`) key line but nothing resolved
+  // from it, refuse rather than guess; `hasUnresolvedDbOnlyDeclaration`
+  // owns the key-line rules. Accepted trade-off: an intentionally empty
+  // `db_only: []` also refuses (same empty config); silently committing
+  // db_only content into permanent git history is high-cost and hard to undo.
+  if (hasUnresolvedDbOnlyDeclaration(repoPath, storageConfig)) {
     const yamlPath = join(repoPath, 'gbrain.yml');
-    const yamlContent = existsSync(yamlPath) ? readFileSync(yamlPath, 'utf-8') : '';
-    // A YAML KEY line (`db_only:` / `supabase_only:`, ignoring leading
-    // whitespace and `#` comments), not a bare substring search — round 9,
-    // P2: a comment or unrelated prose value that happens to mention the
-    // word (e.g. `# db_only handling TBD`) must not trip this guard on an
-    // otherwise-genuinely-config-free gbrain.yml.
-    const mentionsUnresolvedKey = yamlContent.split('\n').some((line) => {
-      const trimmed = line.trim();
-      return !trimmed.startsWith('#') && /^(db_only|supabase_only)\s*:/.test(trimmed);
-    });
-    if (mentionsUnresolvedKey) {
-      throw new Error(
-        `${yamlPath} mentions db_only but no directories resolved from it — refusing to ` +
-          `auto-commit (cannot tell "genuinely empty" from "unsupported syntax silently ignored"). ` +
-          `Fix gbrain.yml's storage.db_only syntax, or git-init this directory manually.`,
-      );
-    }
+    throw new Error(
+      `${yamlPath} mentions db_only but no directories resolved from it — refusing to ` +
+        `auto-commit (cannot tell "genuinely empty" from "unsupported syntax silently ignored"). ` +
+        `Fix gbrain.yml's storage.db_only syntax, or git-init this directory manually.`,
+    );
   }
   // #2964 (round 9, P1): every db_only dir is ALWAYS pathspec-excluded,
   // unconditionally — never pre-filtered against what an existing
@@ -401,6 +599,14 @@ interface PathContainmentOps {
 
 const nativePathContainmentOps: PathContainmentOps = { relative, isAbsolute, sep };
 
+export function gitRelativePath(
+  from: string,
+  to: string,
+  pathOps: Pick<PathContainmentOps, 'relative'> = nativePathContainmentOps,
+): string {
+  return pathOps.relative(from, to).replace(/\\/g, '/');
+}
+
 export function isWithinRoot(
   childReal: string,
   rootReal: string,
@@ -415,11 +621,15 @@ export function isWithinRoot(
 /**
  * #774 NAV-1 TOCTOU: true only if filePath realpath-resolves inside gitRoot.
  * Guards symlink escape at the per-file level (a committed symlink whose
- * target lives outside the repo), not just at scope entry.
+ * target lives outside the repo), not just at scope entry. GBRA-133 S-4: a
+ * leaf that is not a symlink resolves through its parent directory (Bun's
+ * realpathSync returns ENOENT for an existing name containing a backslash).
  */
 export function isPathSafe(filePath: string, gitRoot: string): boolean {
   try {
-    return isWithinRoot(realpathSync(filePath), realpathSync(gitRoot));
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- this is the containment guard: join normalizes the realpath'd parent plus basename, and isWithinRoot below rejects any result outside gitRoot
+    const real = lstatSync(filePath).isSymbolicLink() ? realpathSync(filePath) : join(realpathSync(dirname(filePath)), basename(filePath));
+    return isWithinRoot(real, realpathSync(gitRoot));
   } catch {
     return false;
   }
@@ -428,6 +638,7 @@ export function isPathSafe(filePath: string, gitRoot: string): boolean {
 export function hasOriginRemote(repoPath: string): boolean {
   try {
     execFileSync('git', buildGitInvocation(repoPath, ['remote', 'get-url', 'origin']), {
+      env: gitChildEnv(GIT_READ_ENV),
       encoding: 'utf-8',
       timeout: 30000,
       stdio: ['ignore', 'ignore', 'ignore'],

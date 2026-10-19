@@ -17,8 +17,10 @@ describe('mergedProviderEnv', () => {
   test('folds every file-plane key incl. the Azure fields (unification delta)', () => {
     const env = mergedProviderEnv(cfg({
       openai_api_key: 'sk-o', anthropic_api_key: 'sk-a', voyage_api_key: 'pa-v',
-      zeroentropy_api_key: 'ze', openrouter_api_key: 'or', dashscope_api_key: 'ds',
+      openrouter_api_key: 'or', dashscope_api_key: 'ds',
+      deepseek_api_key: 'sk-deepseek',
       google_api_key: 'gg',
+      azure_openai_api_key: 'az-secret',
       azure_openai_endpoint: 'https://x.openai.azure.com',
       azure_openai_deployment: 'gpt-5',
       azure_openai_use_entra: '1',
@@ -26,13 +28,29 @@ describe('mergedProviderEnv', () => {
     expect(env.OPENAI_API_KEY).toBe('sk-o');
     expect(env.ANTHROPIC_API_KEY).toBe('sk-a');
     expect(env.VOYAGE_API_KEY).toBe('pa-v');
-    expect(env.ZEROENTROPY_API_KEY).toBe('ze');
     expect(env.OPENROUTER_API_KEY).toBe('or');
     expect(env.DASHSCOPE_API_KEY).toBe('ds');
+    expect(env.DEEPSEEK_API_KEY).toBe('sk-deepseek');
     expect(env.GOOGLE_GENERATIVE_AI_API_KEY).toBe('gg');
+    // #4031: the key was the only member of the Azure group left unfolded —
+    // config.json looked complete while every keyless-shell embed failed auth.
+    expect(env.AZURE_OPENAI_API_KEY).toBe('az-secret');
     expect(env.AZURE_OPENAI_ENDPOINT).toBe('https://x.openai.azure.com');
     expect(env.AZURE_OPENAI_DEPLOYMENT).toBe('gpt-5');
     expect(env.AZURE_OPENAI_USE_ENTRA).toBe('1');
+  });
+
+  test('process-env AZURE_OPENAI_API_KEY still wins over config (#4031)', () => {
+    const env = mergedProviderEnv(
+      cfg({ azure_openai_api_key: 'az-config' }),
+      { AZURE_OPENAI_API_KEY: 'az-env' },
+    );
+    expect(env.AZURE_OPENAI_API_KEY).toBe('az-env');
+    // #1249 empty-drop applies to the new fold too.
+    expect(
+      mergedProviderEnv(cfg({ azure_openai_api_key: 'az-config' }), { AZURE_OPENAI_API_KEY: '' })
+        .AZURE_OPENAI_API_KEY,
+    ).toBe('az-config');
   });
 
   test('env wins over config ONLY for real values; empty strings dropped (#1249)', () => {

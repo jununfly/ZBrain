@@ -1,4 +1,4 @@
-<!-- gbrain-runbook-stamp: 0.46.24.0 -->
+<!-- gbrain-runbook-stamp: 0.60.310.0 -->
 <!-- This stamp must equal the VERSION file at every release; CI enforces it
      (scripts/check-bootstrap-tag.sh). `gbrain bootstrap status` compares it to
      the installed binary and warns on skew. -->
@@ -43,7 +43,8 @@ read it and relay it to the human in plain language. Never work around a refusal
 ⛔ **VERIFY BEFORE CLAIMING DONE.** The install is done when `gbrain bootstrap
 verify` exits 0 — not when the transcript looks good. Paste its report to the human.
 
-⛔ **RESPECT THE TOOLCHAIN TRUST RULES.** Install bun via a platform package manager
+⛔ **RESPECT THE TOOLCHAIN TRUST RULES.** GBrain needs Bun 1.4.0 or newer (`bun upgrade`
+updates an older Bun). Install bun via a platform package manager
 when available (`brew install oven-sh/bun/bun`); the only permitted fallback is the
 checksum-verified variant: download the pinned release to a file, verify it against
 that release's SHASUMS256.txt, and only then execute. Install gh the same way —
@@ -89,7 +90,21 @@ registration only with `--mcp-even-if-plugin`.
    `gh auth login -h github.com -p https -w` (you run it; they click Authorize).
    Then `gbrain bootstrap status` — it is idempotent and resume-aware; after any
    partial failure, re-run it and continue where it points.
-2. **Engine.** `gbrain init --pglite` (2 seconds, no server). Search mode is
+2. **Engine.** Two lanes; default to the first:
+   - **PGLite (default):** `gbrain init --pglite` (2 seconds, no server). The
+     per-turn hook context injection works whenever a `gbrain serve` for the
+     brain is running.
+   - **Postgres-first (harness installs):** `gbrain init --prefer-postgres` walks
+     a 5-rung ladder (env URL → Supabase token discovery → local Postgres →
+     `--allow-docker` → PGLite floor) for installs that want concurrent
+     connections or multi-machine access. A Postgres brain keeps the per-turn
+     hook lane too: the IPC listener is engine-uniform and keys its socket off
+     the connection URL, so the hooks fire whenever a `gbrain serve` for the
+     brain is running, same as PGLite (the degradation matrix in
+     `docs/guides/bootstrap.md` carries the row; INSTALL_FOR_AGENTS.md "Engine
+     preference for harness installs" carries the ladder detail).
+
+   Search mode is
    auto-selected silently (conservative when keyless, tokenmax with an
    expansion key) and printed with an `[AGENT]` cost matrix — surface that
    matrix to the human and confirm before running high-volume queries (see
@@ -175,6 +190,35 @@ registration only with `--mcp-even-if-plugin`.
    block below it — the ownership line and the cold-start offer are the two
    things the human must actually understand, not fine print.
 
+<!-- BEGIN multi-agent-rules (identical in AGENTS.md, BOOTSTRAP_FOR_AGENTS.md and INSTALL_FOR_AGENTS.md; bun run check:shared-tree-git) -->
+## Multi-agent rules for a shared brain checkout
+
+Several agents, crons and hooks often commit to one brain checkout on the same
+machine. In such a checkout:
+
+1. **Commit and push with one command, naming your files:**
+   `scripts/brain-commit-push.sh "<msg>" <paths>`, or
+   `gbrain git commit-push -m "<msg>" -- <paths>` when the brain has no helper.
+   It takes the checkout's writer lock, commits only those paths, merges remote
+   commits without touching anyone else's files, and fails loudly if the push
+   does not land.
+2. **Bring remote commits in with `--pull`** (`scripts/brain-commit-push.sh --pull`
+   or `gbrain git commit-push --pull`) at session start and before a batch of writes.
+3. **On a non-zero exit, read the code.** Retry once on `commit_lock_busy`.
+   Stop and relay to the user on `integrate_conflict` (they choose which
+   version wins) and on `writer_coordinator_required` (a managed brain: save
+   pages with `put_page` instead). `pushed_checkout_lagging` is a success.
+<!-- gbrain-allow-shared-tree-git-begin: the forbidden commands, named so agents avoid them -->
+4. **Never run** `git pull --rebase`, `git stash`, `--autostash`, `git add -A`,
+   `git commit -a`, `git reset --hard` or `git push --force` there, and never
+   fall back to them when the command fails. Never delete `.git/rebase-merge`
+   before saving its autostash with `git stash store`.
+<!-- gbrain-allow-shared-tree-git-end -->
+
+Outcomes, conflict recovery, a stuck rebase and the lock contract for host
+daemons: [docs/guides/shared-checkout-git.md](docs/guides/shared-checkout-git.md).
+<!-- END multi-agent-rules -->
+
 ## Machine two
 
 If this workspace was cloned from an existing agent repo (agent.json says
@@ -198,7 +242,7 @@ placeholder). Trust the CLI's detection over your own guesses.
   only repos attached to the session** — a repo created mid-session is NOT
   attached, so `gbrain bootstrap repo` refuses fast in cloud with the flow
   that works. Privacy verification falls back to pure git protocol on its own.
-- **`git push` works only against the session's working branch.** A user PAT
+- **`git push` works only against the session's working branch.** A user PAT <!-- gbrain-allow-shared-tree-git: describes the cloud sandbox's push limit, not a command to run -->
   does not bypass any of this.
 - **Only repo-committed files carry into the next session.** `~/.gbrain`,
   `~/.claude`, and the gitignored `.claude/settings.local.json` evaporate.
@@ -220,29 +264,35 @@ placeholder). Trust the CLI's detection over your own guesses.
 
 ## Failure modes, and what they actually mean
 
-| Symptom | Real cause | Fix |
-|---|---|---|
-| `interview --status` exits nonzero forever | A required answer is genuinely missing | Ask the human. Do not default it. |
-| Render refuses with unresolved tokens | Interview incomplete or a template edit broke a token | Finish the interview; `status` names the tokens. |
-| `verify` fails the magic-moment check | The fact never landed (keyless: the Facts fence was not written) | Re-run the write step it names; check `gbrain doctor`. |
-| Secret-scan block on push | A credential-shaped string in a tracked file | Fix or allowlist deliberately (`.gbrain-scan-allow`); never force. |
-| "bootstrap already running (pid N)" | A concurrent bootstrap holds the lock | Wait or investigate that pid; the lock self-clears when stale. |
-| Brain tools fail with a lock error | Another live session's serve owns the database | Close the other session; sequential use is the v1 contract. |
-| Hook reports "brain context unavailable" | serve not running or degraded | `gbrain doctor` names it; hooks fail open by design. |
-| gh answers 403 "not enabled for this session" | Cloud proxy scoping — the repo is not attached to the session | Expected in cloud; the visibility ladder falls back to git protocol. NEVER shim gh. |
-| "crontab: command not found" / cron skipped | Containers and cloud sandboxes ship without a scheduler | Expected; event-driven pushes cover it — the skip message says exactly this. |
-| A turn shows "workspace push is FAILING" | The background push is refusing (visibility, secret-scan, or network reasons) | Run `gbrain doctor`; the banner repeats every 30 min until fixed. |
+<a id="bootstrap-symptoms"></a>
+
+| Symptom | Real cause | Fix | Who acts | Consent | Verify |
+|---|---|---|---|---|---|
+| `interview --status` exits nonzero forever | A required answer is genuinely missing | Ask the human. Do not default it. | user (answers the question) | none | `gbrain bootstrap interview --status` |
+| Render refuses with unresolved tokens | Interview incomplete or a template edit broke a token | Finish the interview; `status` names the tokens. | user | none | `gbrain bootstrap status` |
+| `verify` fails the magic-moment check | The fact never landed (keyless: the Facts fence was not written) | Re-run the write step it names; check `gbrain doctor`. | agent | none | `gbrain doctor --only bootstrap_last_verify --json` |
+| Secret-scan block on push | A credential-shaped string in a tracked file | Fix or allowlist deliberately (`.gbrain-scan-allow`); never force. | user (decides what to allowlist) | none | the next push's scan output |
+| "bootstrap already running (pid N)" | A concurrent bootstrap holds the lock | Wait or investigate that pid; the lock self-clears when stale. | agent | none | `gbrain bootstrap status` |
+| Brain tools fail with a lock error | Another live session's serve owns the database | Close the other session; sequential use is the v1 contract. | user (closes the other session) | none | `gbrain doctor --only bootstrap_serve_lock --json` |
+| Hook reports "brain context unavailable" | serve not running or degraded | `gbrain doctor` names it; hooks fail open by design. | agent | none | `gbrain doctor --only bootstrap_hooks_heartbeat --json` |
+| gh answers 403 "not enabled for this session" | Cloud proxy scoping — the repo is not attached to the session | Expected in cloud; the visibility ladder falls back to git protocol. NEVER shim gh. | agent (nothing to fix) | none | none needed |
+| "crontab: command not found" / cron skipped | Containers and cloud sandboxes ship without a scheduler | Expected; event-driven pushes cover it — the skip message says exactly this. | agent (nothing to fix) | none | none needed |
+| A turn shows "workspace push is FAILING" | The background push is refusing (visibility, secret-scan, or network reasons) | Run `gbrain doctor`; the banner repeats every 30 min until fixed. | agent | none | `gbrain doctor --only bootstrap_push_health --json` |
 
 ## Hand off
 
 Two things the human must UNDERSTAND before you finish — say them plainly, in
 this order, and confirm they landed:
 
-1. **They own the brain.** Every memory you keep is a markdown file in THEIR
-   private GitHub repo — name the URL. Owning it means: they can read it any
-   time, take it to a second machine (`gbrain bootstrap attach`), or delete the
-   repo and the brain is gone. If they went local-only, say that instead, with
-   `gbrain bootstrap repo` as the any-time upgrade.
+1. **They own the brain.** Their private GitHub repo holds the agent's identity
+   files and committed Markdown pages — name the URL. They can read those files
+   or clone the workspace on another machine and run `gbrain bootstrap attach`.
+   Facts, corrections, jobs, and accounting can exist only in the database, so
+   a Git clone is not a complete memory backup. Back up and restore the full
+   database separately. Deleting the repository does not erase database records,
+   history, source material, or backups. If they went local-only, say the files
+   and database remain on this machine; `gbrain bootstrap repo` can add a private
+   GitHub copy of the workspace files later.
 2. **The first skill to run is cold-start.** An empty brain is a database; a
    filled one is a memory — and every flagship skill (book-mirror, briefings,
    meeting prep) only becomes magical once the brain holds their real life.

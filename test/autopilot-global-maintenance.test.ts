@@ -88,6 +88,11 @@ describe('cycle phase partition (#2194 fix #3)', () => {
     expect(resolveCyclePhases(['synthesize'], undefined)).toEqual(['synthesize']);
   });
 
+  test('default-like source opt-in runs a full implicit cycle without changing explicit phases (#4700)', () => {
+    expect(resolveCyclePhases(undefined, 'repo-a', true)).toEqual(ALL_PHASES);
+    expect(resolveCyclePhases(['sync'], 'repo-a', true)).toEqual(['sync']);
+  });
+
   test('exclusion skip-records never dilute failure status into a stampable partial (#4250 ship-stage P1)', () => {
     // Pre-fix: six failed freshness phases + seventeen synthetic exclusion
     // skips made deriveStatus see "not every entry failed" → 'partial' →
@@ -241,6 +246,37 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
     return handlers;
   }
 
+  test('keyless global maintenance skips embed and still completes other work', async () => {
+    await engine.setConfig('embedding_disabled', 'true');
+    const handlers = await captureHandlers();
+    const handler = handlers.get('autopilot-global-maintenance');
+    const repoPath = mkdtempSync(join(tmpdir(), 'gbrain-keyless-maintenance-'));
+    const result = await handler!({
+      id: 4100,
+      data: { phases: ['embed', 'orphans'], repoPath },
+      signal: undefined,
+    });
+    const embed = result.report.phases.find((p: any) => p.phase === 'embed');
+    expect(embed?.status).toBe('skipped');
+    expect(embed?.details.reason).toBe('embedding_disabled');
+    expect(result.report.phases.find((p: any) => p.phase === 'orphans')?.status).toBe('ok');
+    expect(['ok', 'clean']).toContain(result.report.status);
+    expect(await engine.getConfig(LAST_GLOBAL_AT_KEY)).not.toBeNull();
+  });
+
+  test('enabled embeddings still report a provider configuration failure', async () => {
+    const handlers = await captureHandlers();
+    const handler = handlers.get('autopilot-global-maintenance');
+    const repoPath = mkdtempSync(join(tmpdir(), 'gbrain-enabled-embed-maintenance-'));
+    const result = await handler!({
+      id: 4103,
+      data: { phases: ['embed'], repoPath },
+      signal: undefined,
+    });
+    expect(result.report.phases.find((p: any) => p.phase === 'embed')?.status).toBe('fail');
+    expect(await engine.getConfig(LAST_GLOBAL_AT_KEY)).toBeNull();
+  });
+
   test('autopilot-cycle handler normalizes a legacy per-source payload down to freshness phases', async () => {
     // Pre-v0.46.20 fanout payloads carried NON_GLOBAL_PHASES (mixed +
     // background). A legacy job draining after upgrade must not re-run that
@@ -319,13 +355,16 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
     const repoPath = mkdtempSync(join(tmpdir(), 'gbrain-global-default-'));
     const handlers = await captureHandlers();
     const handler = handlers.get('autopilot-global-maintenance');
-    const result = await handler!({ data: { repoPath }, signal: undefined });
+    // id present so the handler threads a real privateQueueOwnerJobId into
+    // runCycle (worker jobs always carry one).
+    const result = await handler!({ id: 4101, data: { repoPath }, signal: undefined });
     const ranPhases = result.report.phases.map((p: any) => p.phase);
     for (const p of MAINTENANCE_PHASES) expect(ranPhases).toContain(p);
     expect(ranPhases).toContain('synthesize');
     expect(ranPhases).toContain('patterns');
     expect(ranPhases).not.toContain('sync');
-    expect(await engine.getConfig(LAST_GLOBAL_AT_KEY)).not.toBeNull();
+    expect(result.report.phases.some((p: any) => p.status === 'fail')).toBe(true);
+    expect(await engine.getConfig(LAST_GLOBAL_AT_KEY)).toBeNull();
   }, 60_000);
 
   test('runs global phases (no source_id) and stamps autopilot.last_global_at on success', async () => {
@@ -339,15 +378,19 @@ describe('autopilot-global-maintenance handler stamps last_global_at (PGLite)', 
     const handler = handlers.get('autopilot-global-maintenance');
     expect(handler).toBeTruthy();
 
+    // id present so the handler threads a real privateQueueOwnerJobId into
+    // runCycle (worker jobs always carry one).
     const result = await handler!({
-      data: { phases: ['orphans', 'embed'], repoPath },
+      id: 4102,
+      data: { phases: ['orphans'], repoPath },
       signal: undefined,
     });
     // The cycle ran the requested global phases (DB-only on an empty brain).
     const orphans = result.report.phases.find((p: any) => p.phase === 'orphans');
     expect(orphans).toBeTruthy();
     expect(orphans.details.source_id).toBeUndefined();
-    expect(['ok', 'clean', 'partial']).toContain(result.report.status);
+    expect(result.report.phases.some((p: any) => p.status === 'fail')).toBe(false);
+    expect(['ok', 'clean']).toContain(result.report.status);
     // Freshness stamped so the dispatch gate backs off.
     const stamped = await engine.getConfig(LAST_GLOBAL_AT_KEY);
     expect(stamped).not.toBeNull();

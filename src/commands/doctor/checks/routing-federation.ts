@@ -7,8 +7,20 @@
 import { existsSync, readFileSync } from 'fs';
 import type { BrainEngine } from '../../../core/engine.ts';
 import { gbrainPath } from '../../../core/config.ts';
-import { isUndefinedTableError, isUndefinedColumnError } from '../../../core/utils.ts';
+import { embedBackfillWorkerSurface } from '../../../core/minions/embed-backfill-admission.ts';
+import { isMissingSchemaObject } from '../../../core/utils.ts';
+import { adoptedSkillPackSourceIds } from '../../../core/shared-skills/adopted-packs.ts';
+import { ALLOWED_SCOPES_LIST, DCR_REGISTRABLE_SCOPES } from '../../../core/scope.ts';
 import type { Check } from '../../doctor.ts';
+
+/**
+ * Scopes beyond the anonymous-DCR ceiling — DERIVED as the complement of
+ * `DCR_REGISTRABLE_SCOPES` over `ALLOWED_SCOPES_LIST` (never hand-copied), so
+ * a scope added to scope.ts is audited by arm (c) below automatically.
+ */
+export const DCR_PRIVILEGED_SCOPES: ReadonlyArray<string> = Object.freeze(
+  ALLOWED_SCOPES_LIST.filter((s) => !DCR_REGISTRABLE_SCOPES.has(s)),
+);
 
 /**
  * v0.37.7.0 — Tier 5K source_routing_health (D5 lock: 200-page total cap).
@@ -22,6 +34,10 @@ import type { Check } from '../../doctor.ts';
  *    `sync.respect_gitignore` is unset/false (info-line nudge for
  *    Tier 4I's opt-in flag).
  *
+ * A zero-page source that holds an adopted skill pack (a dedicated skills
+ * source has no pages by design) is not warned about: see
+ * `adoptedSkillPackSourceIds`.
+ *
  * Cost-bounded: total cap of 200 means a 20-source CEO brain pays
  * 20*10 = 200 selects rather than 20*50 = 1000.
  */
@@ -34,16 +50,19 @@ export async function checkSourceRoutingHealth(engine: BrainEngine): Promise<Che
       return { name: 'source_routing_health', status: 'ok', message: 'Single-source brain (no federation to check)' };
     }
     const perSourceCap = Math.min(50, Math.ceil(200 / Math.max(1, sources.length)));
-    const emptySources: string[] = [];
+    const zeroPageSources: string[] = [];
     for (const s of sources) {
       const rows = await engine.executeRaw<{ n: string }>(
         `SELECT COUNT(*)::text AS n FROM pages WHERE source_id = $1 LIMIT $2`,
         [s.id, perSourceCap],
       );
       if (Number(rows[0]?.n ?? 0) === 0) {
-        emptySources.push(s.id);
+        zeroPageSources.push(s.id);
       }
     }
+    const packSources = zeroPageSources.length > 0 ? await adoptedSkillPackSourceIds(engine) : new Set<string>();
+    const skillPackSources = zeroPageSources.filter((id) => packSources.has(id));
+    const emptySources = zeroPageSources.filter((id) => !packSources.has(id));
     if (emptySources.length > 0) {
       return {
         name: 'source_routing_health',
@@ -58,7 +77,8 @@ export async function checkSourceRoutingHealth(engine: BrainEngine): Promise<Che
     return {
       name: 'source_routing_health',
       status: 'ok',
-      message: `Multi-source brain (${sources.length} non-default source(s)); all populated`,
+      message: `Multi-source brain (${sources.length} non-default source(s)); all populated`
+        + (skillPackSources.length ? ` (skill-pack sources hold no pages by design: ${skillPackSources.join(', ')})` : ''),
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -80,13 +100,22 @@ export async function checkSourceRoutingHealth(engine: BrainEngine): Promise<Che
  *
  * Single-source brain short-circuits to ok (no federation to check).
  * Each warning carries a paste-ready remediation hint.
+ *
+ * `opts.sourceIds` (the remote caller's grant) confines the dashboard to
+ * those sources: a source-bound token never reads another source's id, lag,
+ * coverage or failed-job count, and the single-source short-circuit is
+ * judged on brain-wide state only for unscoped callers.
  */
-export async function checkFederationHealth(engine: BrainEngine): Promise<Check> {
+export async function checkFederationHealth(engine: BrainEngine, opts: { sourceIds?: string[] } = {}): Promise<Check> {
   try {
     const { loadAllSources } = await import('../../../core/sources-load.ts');
     const { computeAllSourceMetrics } = await import('../../../core/source-health.ts');
-    const sources = await loadAllSources(engine, { includeArchived: false });
-    if (sources.length <= 1) {
+    const allSources = await loadAllSources(engine, { includeArchived: false });
+    const sources = opts.sourceIds ? allSources.filter((s) => opts.sourceIds!.includes(s.id)) : allSources;
+    if (opts.sourceIds && sources.length === 0) {
+      return { name: 'federation_health', status: 'ok', message: 'No sources in scope to check' };
+    }
+    if (!opts.sourceIds && sources.length <= 1) {
       return {
         name: 'federation_health',
         status: 'ok',
@@ -98,13 +127,16 @@ export async function checkFederationHealth(engine: BrainEngine): Promise<Check>
     const warns: string[] = [];
     const fails: string[] = [];
     for (const m of metrics) {
+      const embedRemedy = embedBackfillWorkerSurface(engine).status === 'no_worker_surface'
+        ? `gbrain embed --stale --source ${m.source_id}`
+        : `gbrain jobs submit embed-backfill --params '{"sourceId":"${m.source_id}"}'`;
       // Fail thresholds first (most severe)
       if (m.lag_seconds !== null && m.lag_seconds > 24 * 3600) {
         fails.push(`${m.source_id}: stale ${Math.floor(m.lag_seconds / 3600)}h — run \`gbrain sync trigger --source ${m.source_id}\``);
         continue;
       }
       if (m.embed_coverage_pct < 50 && m.total_chunks > 1000) {
-        fails.push(`${m.source_id}: ${m.embed_coverage_pct.toFixed(1)}% embed coverage (${m.total_chunks.toLocaleString()} chunks) — run \`gbrain jobs submit embed-backfill --params '{"sourceId":"${m.source_id}"}'\``);
+        fails.push(`${m.source_id}: ${m.embed_coverage_pct.toFixed(1)}% embed coverage (${m.total_chunks.toLocaleString()} chunks) — run \`${embedRemedy}\``);
         continue;
       }
       // Warns
@@ -112,7 +144,7 @@ export async function checkFederationHealth(engine: BrainEngine): Promise<Check>
         warns.push(`${m.source_id}: federated source ${Math.floor(m.lag_seconds / 3600)}h+ stale — run \`gbrain sync trigger --source ${m.source_id}\``);
       }
       if (m.embed_coverage_pct < 95 && m.total_chunks > 100) {
-        warns.push(`${m.source_id}: ${m.embed_coverage_pct.toFixed(1)}% embed coverage — run \`gbrain jobs submit embed-backfill --params '{"sourceId":"${m.source_id}"}'\``);
+        warns.push(`${m.source_id}: ${m.embed_coverage_pct.toFixed(1)}% embed coverage — run \`${embedRemedy}\``);
       }
       if (m.failed_jobs_24h >= 3) {
         warns.push(`${m.source_id}: ${m.failed_jobs_24h} failures in 24h — check \`gbrain jobs list --status failed\``);
@@ -186,7 +218,7 @@ export async function checkOauthConfidentialHealth(engine: BrainEngine): Promise
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     // Pre-OAuth schema (oauth_clients table missing) → ok.
-    if (msg.toLowerCase().includes('relation') && msg.toLowerCase().includes('does not exist')) {
+    if (isMissingSchemaObject(e, 'table', 'oauth_clients')) {
       return { name: 'oauth_confidential_client_health', status: 'ok', message: 'OAuth not configured (skipping)' };
     }
     return { name: 'oauth_confidential_client_health', status: 'warn', message: `Check failed: ${msg}` };
@@ -253,14 +285,57 @@ export async function checkOauthClientScopeHealth(engine: BrainEngine): Promise<
       orphaned = await engine.executeRaw<{ id: string }>(orphanSql(true), [WORKSPACE_SUFFIX]);
     } catch (e) {
       // Pre-v0.31 brain without the facts table: a source can't hold facts it
-      // has no table for — retry without the exclusion. Scoped here (code-first
-      // classification + the message must name `facts`) so the dangling-grant
-      // arm's findings above aren't lost to the outer catch's schema-degrade.
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!(isUndefinedTableError(e) && /facts/i.test(msg))) throw e;
+      // has no table for — retry without the exclusion. Scoped here so the
+      // dangling-grant arm's findings above aren't lost to the outer catch.
+      if (!isMissingSchemaObject(e, 'table', 'facts')) throw e;
       orphaned = await engine.executeRaw<{ id: string }>(orphanSql(false), [WORKSPACE_SUFFIX]);
     }
+    // (c) PRIVILEGED SELF-REGISTERED CLIENTS — an active row whose scope
+    // exceeds the DCR ceiling (read/write) AND carries the anonymous-DCR
+    // signature: grant_revision = 0 with no oauth_grant_audit 'register' row
+    // (every operator path writes one). Nothing sweeps such rows on upgrade,
+    // so this is the operator's visibility into clients that were registered
+    // before the ceiling existed (or that predate the grant audit log — the
+    // same signature, hence ADVISORY). Fail-open to "unknown" when the audit
+    // table / revision column is absent: without them the signature cannot be
+    // evaluated and guessing would either lie green or cry wolf.
+    let privilegedDcr: Array<{ client_id: string; client_name: string | null; scope: string }> = [];
+    let privilegedDcrNote: string | null = null;
+    // Word-bounded match over the DERIVED complement (scope ids are [a-z_]+,
+    // so the alternation needs no escaping); bound as a parameter, never
+    // interpolated into the SQL text.
+    const privilegedScopeRegex = `(^|[[:space:]])(${DCR_PRIVILEGED_SCOPES.join('|')})([[:space:]]|$)`;
+    const dcrCeiling = [...DCR_REGISTRABLE_SCOPES];
+    try {
+      privilegedDcr = await engine.executeRaw<{ client_id: string; client_name: string | null; scope: string }>(
+        `SELECT c.client_id, c.client_name, c.scope
+           FROM oauth_clients c
+          WHERE c.deleted_at IS NULL
+            AND COALESCE(c.grant_revision, 0) = 0
+            AND COALESCE(c.scope, '') ~ $1
+            AND NOT EXISTS (
+              SELECT 1 FROM oauth_grant_audit a
+               WHERE a.client_id = c.client_id AND a.action = 'register'
+            )
+          ORDER BY c.client_id`,
+        [privilegedScopeRegex],
+      );
+    } catch (e) {
+      if (!(isMissingSchemaObject(e, 'table', 'oauth_grant_audit') || isMissingSchemaObject(e, 'column', 'grant_revision'))) throw e;
+      privilegedDcrNote = 'self-registered-client scope audit skipped: grant audit schema not present (run `gbrain apply-migrations --yes`), so privileged self-registered clients are unknown';
+    }
     const problems: string[] = [];
+    if (privilegedDcr.length > 0) {
+      const shown = privilegedDcr.slice(0, 5)
+        .map(c => `"${c.client_name ?? c.client_id}" (${c.client_id}) scope=${c.scope}`);
+      problems.push(
+        `${privilegedDcr.length} active OAuth client(s) hold a scope beyond the self-registration ceiling (${dcrCeiling.join('/')}) ` +
+        `and look self-registered (no operator grant record): ${shown.join('; ')}` +
+        (privilegedDcr.length > 5 ? ` (+${privilegedDcr.length - 5} more)` : '') +
+        `. If you did not register these yourself, narrow with \`gbrain auth rescope-client <client_id> --scopes ${dcrCeiling.join(',')}\` ` +
+        `or remove with \`gbrain auth revoke-client <client_id>\`.`,
+      );
+    }
     if (dangling.length > 0) {
       const byClient = new Map<string, { name: string | null; grants: string[] }>();
       for (const d of dangling) {
@@ -294,20 +369,18 @@ export async function checkOauthClientScopeHealth(engine: BrainEngine): Promise<
     return {
       name: 'oauth_client_scope_health',
       status: 'ok',
-      message: 'Scoped-client grants consistent (no dangling federated reads, no orphaned workspace sources)',
+      message: 'Scoped-client grants consistent (no dangling federated reads, no orphaned workspace sources' +
+        (privilegedDcrNote ? `; ${privilegedDcrNote})` : ', no privileged self-registered clients)'),
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    // Pre-OAuth schema (table missing) or pre-migration schema (column
-    // missing) → ok, matching the confidential-client check's posture.
-    // CODE-FIRST classification (42P01/42703 via core/utils): a bare message
-    // regex would classify e.g. `function unnest(jsonb) does not exist` — a
-    // type-drift failure this check exists to catch — as "schema not present"
-    // and lie green. Column candidates are the optional oauth-scoping columns
-    // this check's queries touch.
-    const missingColumn = ['federated_read', 'source_id', 'deleted_at', 'archived', 'local_path']
-      .some((c) => isUndefinedColumnError(e, c));
-    if (isUndefinedTableError(e) || missingColumn) {
+    // Pre-OAuth schema (oauth_clients missing) or pre-migration schema (one
+    // of the optional oauth-scoping columns missing) → ok, matching the
+    // confidential-client check's posture. Any other missing object, or a
+    // type-drift failure like `function unnest(jsonb) does not exist`, is a
+    // real failure this check exists to catch.
+    if (isMissingSchemaObject(e, 'table', 'oauth_clients')
+      || isMissingSchemaObject(e, 'column', ['federated_read', 'source_id', 'deleted_at', 'archived', 'local_path'])) {
       return { name: 'oauth_client_scope_health', status: 'ok', message: 'OAuth scoping schema not present (skipping)' };
     }
     return { name: 'oauth_client_scope_health', status: 'warn', message: `Check failed: ${msg}` };
@@ -408,13 +481,20 @@ export async function checkStaleLocks(
     }
     const lines = stale.slice(0, 10).map(s => {
       const ageH = Math.floor(s.age_ms / 3600_000);
-      let breakHint = 'gbrain doctor';
+      // Every hint here must be a REAL command: `gbrain dream --break-lock`
+      // was advertised for years but dream never implemented the flag —
+      // pasting the hint ran a full (paid) dream cycle instead of breaking a
+      // lock. Cycle locks: dead-holder rows on THIS host are reaped by
+      // `gbrain doctor --fix` (checkStaleLocks above) and swept automatically
+      // at the next dream-cycle start; cross-host or live-holder locks have
+      // no safe break command by design. The old fallback 'gbrain doctor' was
+      // circular (this line IS doctor output) and plain doctor reaps nothing.
+      let breakHint =
+        'expired lock is swept at the next acquire; if it persists, inspect the gbrain_cycle_locks row';
       if (s.id.startsWith('gbrain-sync:')) {
         breakHint = `gbrain sync --break-lock --source ${s.id.slice('gbrain-sync:'.length)}`;
-      } else if (s.id.startsWith('gbrain-cycle:')) {
-        breakHint = `gbrain dream --break-lock --source ${s.id.slice('gbrain-cycle:'.length)}`;
-      } else if (s.id === 'gbrain-cycle') {
-        breakHint = 'gbrain dream --break-lock';
+      } else if (s.id.startsWith('gbrain-cycle:') || s.id === 'gbrain-cycle') {
+        breakHint = 'gbrain doctor --fix (reaps dead holders on this host; also swept at next dream start)';
       }
       return `  ${s.id} (pid ${s.holder_pid} on ${s.holder_host}, age ${ageH}h) → ${breakHint}`;
     });
@@ -435,7 +515,7 @@ export async function checkStaleLocks(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     // Pre-v0.30 brains may not have the gbrain_cycle_locks table yet.
-    if (/relation .* does not exist|no such table/i.test(msg)) {
+    if (isMissingSchemaObject(e, 'table', 'gbrain_cycle_locks')) {
       return { name: 'stale_locks', status: 'ok', message: 'gbrain_cycle_locks table not yet provisioned (skipping)' };
     }
     return { name: 'stale_locks', status: 'warn', message: `Check failed: ${msg}` };
@@ -488,4 +568,3 @@ export function checkCyclePhaseScope(): Check {
     return { name: 'cycle_phase_scope', status: 'warn', message: `Check failed: ${msg}` };
   }
 }
-

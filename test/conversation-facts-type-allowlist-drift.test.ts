@@ -183,7 +183,10 @@ describe('ALLOWED_TYPES — canonical source of truth (leaf module)', () => {
 describe('DRIFT GUARD — consumer sites derive from the leaf module (re-hardcode + wrong-import trip-wire)', () => {
   for (const [label, relPath] of [
     ['doctor.ts', 'commands/doctor.ts'],
+    ['conversation-coverage.ts', 'commands/doctor/checks/conversation-coverage.ts'],
     ['jobs.ts', 'commands/jobs.ts'],
+    // W4 jobs: the extract-conversation-facts handler body moved out of jobs.ts.
+    ['handlers/extract-conversation-facts.ts', 'core/minions/handlers/extract-conversation-facts.ts'],
     ['sources.ts', 'commands/sources.ts'],
     ['conversation-facts-backfill.ts', 'core/cycle/conversation-facts-backfill.ts'],
   ] as const) {
@@ -198,7 +201,7 @@ describe('DRIFT GUARD — consumer sites derive from the leaf module (re-hardcod
     test(`${label}: does not import ALLOWED_TYPES from extract-conversation-facts.ts`, () => {
       const src = readSrc(relPath);
       expect(
-        countAllowedTypesImportsFrom(src, '\\.\\.?(?:/\\.\\.)?/commands/extract-conversation-facts\\.ts') +
+        countAllowedTypesImportsFrom(src, '\\.\\.?(?:/\\.\\.)*/commands/extract-conversation-facts\\.ts') +
           countAllowedTypesImportsFromCommandModule(src),
       ).toBe(0);
     });
@@ -209,12 +212,18 @@ describe('DRIFT GUARD — consumer sites derive from the leaf module (re-hardcod
     expect(countAllowedTypesImportsFrom(src, '\\.\\./facts/conversation-types\\.ts')).toBe(1);
   });
 
-  test('doctor.ts: imports ALLOWED_TYPES from the leaf exactly once', () => {
-    // Post-peel (v0.46.9.1 containment sprint) doctor.ts keeps ONE call site
-    // (the buildChecks parser sample); the backlog check moved to
-    // doctor/checks/search-eval.ts and is guarded separately below.
+  test('doctor.ts: no longer imports ALLOWED_TYPES (all call sites peeled)', () => {
+    // The backlog check moved to doctor/checks/search-eval.ts and the
+    // parser-sample scan (conversation_format_coverage, #4193) moved to
+    // doctor/checks/conversation-coverage.ts; each is guarded separately.
     const src = readSrc('commands/doctor.ts');
-    expect(countAllowedTypesImportsFrom(src, '\\.\\./core/facts/conversation-types\\.ts')).toBe(1);
+    expect(countAllowedTypesImportsFrom(src, '\\.\\./core/facts/conversation-types\\.ts')).toBe(0);
+    expect((src.match(/\bALLOWED_TYPES\b/g) ?? []).length).toBe(0);
+  });
+
+  test('doctor/checks/conversation-coverage.ts: the peeled coverage check derives from the leaf', () => {
+    const src = readSrc('commands/doctor/checks/conversation-coverage.ts');
+    expect(countAllowedTypesImportsFrom(src, '\\.\\./\\.\\./\\.\\./core/facts/conversation-types\\.ts')).toBe(1);
     expect((src.match(/\bALLOWED_TYPES\b/g) ?? []).length).toBeGreaterThanOrEqual(2); // import + 1 usage
   });
 
@@ -232,15 +241,16 @@ describe('DRIFT GUARD — consumer sites derive from the leaf module (re-hardcod
     // requires either dropping this reference (fails here) or re-adding a
     // hand-copied list (fails the detector). The old guard was a byte-exact
     // match on the stale 4-element union cast, which a 4-element runtime
-    // filter re-add sailed straight past.
-    const src = readSrc('commands/jobs.ts');
+    // filter re-add sailed straight past. W4 jobs moved the handler body from
+    // jobs.ts into its own module; the guard follows it there.
+    const src = readSrc('core/minions/handlers/extract-conversation-facts.ts');
     expect(src).toMatch(/job\.data\.types[\s\S]{0,400}?\bALLOWED_TYPES\b/);
   });
 
   test('jobs.ts: imports ALLOWED_TYPES + AllowedType from the leaf exactly once', () => {
-    const src = readSrc('commands/jobs.ts');
-    expect(countAllowedTypesImportsFrom(src, '\\.\\./core/facts/conversation-types\\.ts')).toBe(1);
-    expect(src).toContain("type AllowedType } from '../core/facts/conversation-types.ts'");
+    const src = readSrc('core/minions/handlers/extract-conversation-facts.ts');
+    expect(countAllowedTypesImportsFrom(src, '\\.\\./\\.\\./facts/conversation-types\\.ts')).toBe(1);
+    expect(src).toContain("type AllowedType } from '../../facts/conversation-types.ts'");
   });
 
   test('sources.ts: FACTS_BACKFILL_ALLOWED imports ALLOWED_TYPES from the leaf', () => {

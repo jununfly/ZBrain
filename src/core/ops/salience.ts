@@ -9,6 +9,7 @@
  */
 
 import type { Operation } from './contract.ts';
+import { readPolicyOpts } from './context.ts';
 import {
   GET_RECENT_SALIENCE_DESCRIPTION,
   FIND_ANOMALIES_DESCRIPTION,
@@ -18,38 +19,40 @@ import {
 
 const get_recent_salience: Operation = {
   name: 'get_recent_salience',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
   description: GET_RECENT_SALIENCE_DESCRIPTION,
   scope: 'read',
   params: {
-    days: { type: 'number', description: 'Window in days. Default 14.' },
-    limit: { type: 'number', description: 'Max results (default 20, capped at 100).' },
+    days: { type: 'number', description: 'Window in days (default 14).' },
+    limit: { type: 'number', description: 'Max results (default 20).' },
     slugPrefix: {
       type: 'string',
-      description: "Optional slug-prefix filter, e.g. 'personal' or 'wiki/people'.",
+      description: 'Slug prefix.',
     },
     recency_bias: {
       type: 'string',
       enum: ['flat', 'on'],
-      description:
-        "v0.29.1: how to weight recency in the salience score.\n" +
-        "  'flat' (DEFAULT) — v0.29.0 behavior. Every page gets 1/(1+days_old).\n" +
-        "                     Stable, predictable; what most callers want.\n" +
-        "  'on'             — Per-prefix decay map. concepts/originals/writing/\n" +
-        "                     become evergreen (recency component = 0); daily/,\n" +
-        "                     media/x/, chat/ decay aggressively. Use when the\n" +
-        "                     user explicitly biases for recency-aware salience\n" +
-        "                     ('what's been salient lately' vs 'what matters\n" +
-        "                     in this brain regardless of when').",
+      description: 'flat (default) or on (per-prefix decay).',
     },
   },
   handler: async (ctx, p) => {
     const recencyBias = p.recency_bias === 'on' ? 'on' : 'flat';
-    return ctx.engine.getRecentSalience({
+    // Scope by the caller's source (canonical sourceScopeOpts ladder: federated
+    // array > scalar > nothing), matching find_orphans/find_experts. Pre-fix
+    // this op returned brain-wide salience regardless of a source-bound OAuth
+    // client's grant — a read leak in the v0.34.1 (#861) source-isolation class
+    // that the v0.29 salience/anomaly batch missed. Trusted local callers
+    // (ctx.remote === false) still get the empty scope = full brain.
+    const rows = await ctx.engine.getRecentSalience({
       days: typeof p.days === 'number' ? p.days : undefined,
       limit: typeof p.limit === 'number' ? p.limit : undefined,
       slugPrefix: typeof p.slugPrefix === 'string' ? p.slugPrefix : undefined,
       recency_bias: recencyBias,
+      ...await readPolicyOpts(ctx),
     });
+    return rows;
   },
   // hidden: 'salience' is in CLI_ONLY (src/cli.ts) — runSalience owns the CLI
   // surface; the non-hidden hint was dead (CLI_ONLY wins at dispatch).
@@ -58,28 +61,39 @@ const get_recent_salience: Operation = {
 
 const find_anomalies: Operation = {
   name: 'find_anomalies',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
   description: FIND_ANOMALIES_DESCRIPTION,
   scope: 'read',
   params: {
     since: {
       type: 'string',
-      description: 'ISO date YYYY-MM-DD. Default = today (UTC).',
+      description: 'YYYY-MM-DD (default today).',
     },
     lookback_days: {
       type: 'number',
-      description: 'Days of history for the baseline. Default 30.',
+      description: 'Baseline days (default 30).',
     },
     sigma: {
       type: 'number',
-      description: 'Sigma threshold. Default 3.0.',
+      description: 'Threshold (default 3).',
     },
   },
   handler: async (ctx, p) => {
-    return ctx.engine.findAnomalies({
+    // Scope by the caller's source (same v0.34.1 #861 source-isolation class as
+    // get_recent_salience above — the v0.29 batch missed both). Applied to the
+    // baseline AND today windows inside the engine so the anomaly math stays
+    // self-consistent. Trusted local callers (ctx.remote === false) get the
+    // empty scope = full brain.
+    const anomalies = await ctx.engine.findAnomalies({
       since: typeof p.since === 'string' ? p.since : undefined,
       lookback_days: typeof p.lookback_days === 'number' ? p.lookback_days : undefined,
       sigma: typeof p.sigma === 'number' ? p.sigma : undefined,
+      ...await readPolicyOpts(ctx),
     });
+
+    return anomalies;
   },
   // hidden: 'anomalies' is in CLI_ONLY (src/cli.ts) — runAnomalies owns the
   // CLI surface; the non-hidden hint was dead (CLI_ONLY wins at dispatch).

@@ -5,7 +5,7 @@
  */
 import { readFileSync, statSync } from 'fs';
 import { join } from 'path';
-import { createInterface } from 'readline';
+import { promptYesNo } from './confirm-prompt.ts';
 import type { BrainEngine } from './engine.ts';
 import { collectSyncableFiles } from '../commands/import.ts';
 import { isSyncable } from './sync.ts';
@@ -22,7 +22,7 @@ import {
   formatUsdLimit,
   resolveSpendPosture,
 } from './spend-posture.ts';
-import { estimateTokens, CHUNKER_VERSION } from './chunkers/code.ts';
+import { estimateTokens, chunkerStamp, detectCodeLanguage } from './chunkers/code.ts';
 import {
   estimateEmbeddingCostUsd,
   getEmbeddingModelName,
@@ -33,7 +33,12 @@ import {
 } from './embedding.ts';
 import { estimateCostFromChars } from './embedding-pricing.ts';
 import { SPEND_CAP_CONFIG_KEY } from './embed-backfill-submit.ts';
+import {
+  embedBackfillManualDrainCommand,
+  type EmbedBackfillWorkerSurface,
+} from './minions/embed-backfill-admission.ts';
 import { git, hasOriginRemote, isDetachedHead, unique } from './sync-git.ts';
+import { readManagedMode } from './persistence/managed-mode.ts';
 
 /**
  * Walk ONE source's working tree and sum tokens for every syncable file.
@@ -70,6 +75,39 @@ export function estimateSourceTreeTokens(
   } catch {
     // Best-effort: a source whose local_path is gone/unreadable contributes 0.
   }
+  return { tokens, files };
+}
+
+/**
+ * The languages whose grammar revision differs between a stored chunker stamp and
+ * the current one, when CHUNKER_VERSION itself is unchanged; null when the drift
+ * is the version (every code page re-chunks) or the stamp is unreadable.
+ */
+export function grammarOnlyDrift(stored: string | null, current: string): Set<string> | null {
+  if (stored === null) return null;
+  const parse = (stamp: string) => { const [version, ...revs] = stamp.split(';'); return { version, revs: new Map(revs.map(r => r.split('=') as [string, string])) }; };
+  const a = parse(stored), b = parse(current);
+  if (a.version !== b.version) return null;
+  const langs = new Set<string>();
+  for (const [lang, rev] of b.revs) if (a.revs.get(lang) !== rev) langs.add(lang);
+  for (const lang of a.revs.keys()) if (!b.revs.has(lang)) langs.add(lang);
+  return langs;
+}
+
+/** Tokens of the source's files in the given languages only (a grammar-revision drift re-chunks nothing else). */
+function estimateLanguageTokens(localPath: string, strategy: 'markdown' | 'code' | 'auto', languages: Set<string>): { tokens: number; files: number } {
+  let tokens = 0, files = 0;
+  try {
+    for (const fullPath of collectSyncableFiles(localPath, { strategy })) {
+      const lang = detectCodeLanguage(fullPath);
+      if (!lang || !languages.has(lang)) continue;
+      try {
+        if (statSync(fullPath).size > 5_000_000) continue;
+        tokens += estimateTokens(readFileSync(fullPath, 'utf-8'));
+        files++;
+      } catch { /* best-effort per file, as the tree walk */ }
+    }
+  } catch { /* best-effort: an unreadable source contributes 0 */ }
   return { tokens, files };
 }
 
@@ -152,7 +190,7 @@ export interface InlineEstimate {
   changedSources: number;
   unchangedSources: number;
   estimateKind: EstimateKind;
-  /** Per-source ceiling reasons (chunker_drift / first_sync / git_unavailable) for honest labeling. */
+  /** Per-source ceiling reasons (chunker_drift / grammar_drift / first_sync / git_unavailable) for honest labeling. */
   ceilingReasons: string[];
 }
 
@@ -165,6 +203,12 @@ export interface InlineEstimate {
  *   2. chunker drift (stored !== current)     → full-tree CEILING (a drift forces
  *        performFullSync → full re-chunk → full re-embed; a delta would
  *        underestimate by the whole corpus). kind: ceiling_chunker_drift
+ *        #6858: skipped when `chunkerDriftWalks` is false. A managed incremental
+ *        sync imports only the delta and keeps the stamp (sync-prepare.ts), so
+ *        the drift never walks the tree there and the delta rung prices it.
+ *        A drift in a language's grammar revision alone (`GRAMMAR_REVISIONS`,
+ *        CHUNKER_VERSION unchanged) prices only that language's files: the
+ *        walk re-imports nothing else. kind: ceiling_grammar_drift
  *   3. last_commit === fetch target           → 0 (mirrors `up_to_date` at
  *        sync.ts:1402 — NO clean-working-tree requirement; a dirty tree whose
  *        commits are caught up imports nothing). kind: unchanged
@@ -188,7 +232,7 @@ export function estimateInlineNewTokens(
     chunker_version: string | null;
   }>,
   currentChunkerVersion: string,
-  opts: { forceFullTree?: boolean } = {},
+  opts: { forceFullTree?: boolean; chunkerDriftWalks?: boolean } = {},
 ): InlineEstimate {
   let tokens = 0;
   let changedSources = 0;
@@ -220,7 +264,17 @@ export function estimateInlineNewTokens(
     }
 
     // Rung 2: chunker drift forces a full re-chunk → full re-embed. CEILING.
-    if (src.chunker_version !== currentChunkerVersion) {
+    // A drift in grammar revisions alone re-chunks only those languages' files:
+    // the walk compares hashes and every other file's hash is unchanged.
+    if (opts.chunkerDriftWalks !== false && src.chunker_version !== currentChunkerVersion) {
+      const languages = grammarOnlyDrift(src.chunker_version, currentChunkerVersion);
+      if (languages) {
+        tokens += estimateLanguageTokens(localPath, strategy, languages).tokens;
+        changedSources++;
+        hadCeiling = true;
+        ceilingReasons.push('grammar_drift');
+        continue;
+      }
       ceiling(localPath, strategy, 'chunker_drift');
       continue;
     }
@@ -314,18 +368,6 @@ async function resolveBackfillCapUsd(engine: BrainEngine): Promise<number> {
   }
 }
 
-/** Interactive [y/N] prompt. Resolves false on non-y answers or EOF. */
-async function promptYesNo(question: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes');
-    });
-    rl.on('close', () => resolve(false));
-  });
-}
-
 // v0.42.42.0 (#2139): paste-ready knobs appended to every gate message so the
 // spend-control surface is discoverable at the moment of need (humans + agents),
 // not only after reading source. Closes the issue's "takes archaeology" complaint.
@@ -349,6 +391,7 @@ function labelEstimate(inline: InlineEstimate): string {
 }
 
 type CostGateSource = {
+  sourceId?: string;
   local_path: string | null;
   config: Record<string, unknown>;
   last_commit: string | null;
@@ -366,11 +409,28 @@ interface CostGateContext {
   includeGitignored?: boolean;
   /** Message prefix ('sync --all' | 'sync'). */
   label: string;
+  /** Public queue capability resolved at the command boundary. */
+  workerSurface: EmbedBackfillWorkerSurface;
+  /** Submission policy; distinct from whether the runtime has a worker. */
+  autoSubmitEnabled: boolean;
 }
 
+/**
+ * #4684: under `--json` a proceed path never prints — it hands its status
+ * object back as `notice` so the caller nests it in the ONE terminal envelope
+ * (`cost_gate`). Human output and every 'stop' path print here unchanged.
+ */
 type CostGateOutcome =
-  | { action: 'proceed'; autoDeferEmbeds: boolean }
+  | { action: 'proceed'; autoDeferEmbeds: boolean; notice?: Record<string, unknown> }
   | { action: 'stop' };
+
+type ManualDrainReason = 'no_worker_surface' | 'auto_submit_disabled';
+
+function manualDrainCommands(sources: CostGateSource[]): string[] {
+  return unique(
+    sources.map((source) => embedBackfillManualDrainCommand(source.sourceId ?? 'default')),
+  );
+}
 
 /**
  * v0.42.42.0 (#2139): the inline-embed cost gate, shared by BOTH `sync --all`
@@ -395,6 +455,10 @@ export async function runInlineCostGate(
   ctx: CostGateContext,
 ): Promise<CostGateOutcome> {
   const { sources, mode, dryRun, jsonOut, yesFlag, full, label } = ctx;
+  const manualDrainReason: ManualDrainReason | undefined =
+    ctx.workerSurface.status === 'no_worker_surface'
+      ? 'no_worker_surface'
+      : ctx.autoSubmitEnabled ? undefined : 'auto_submit_disabled';
 
   // Stale backlog: cheap single SQL; fail-open to 0 so a transient DB hiccup
   // never blocks the sync. Signature-aware (model/dims swap surfaces here).
@@ -433,6 +497,40 @@ export async function runInlineCostGate(
       `Current backlog ~${staleChars.toLocaleString()} chars (~$${staleCostUsd.toFixed(2)} on ` +
       `${embeddingModelName}) across ${sources.length} source(s); ` +
       `${queuedBackfills} backfill job(s) queued.`;
+    if (manualDrainReason) {
+      const commands = manualDrainCommands(sources);
+      const refusal = manualDrainReason === 'no_worker_surface'
+        ? 'no persistent worker surface is available'
+        : 'automatic backfill submission is disabled by --no-auto-embed';
+      const manualMsg =
+        `${label}: embedding will not run inline and ${refusal}. ` +
+        `Manual drain required: ${commands.map((command) => `\`${command}\``).join(', ')}.`;
+      if (dryRun) {
+        if (jsonOut) {
+          console.log(JSON.stringify({
+            status: 'dry_run', mode, gate: 'dry_run', delivery: 'manual',
+            reason: manualDrainReason, workerSurface: ctx.workerSurface.status,
+            staleChars, staleCostUsd, capUsd: formatUsdLimit(capUsd),
+            floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName,
+            manualCommands: commands,
+          }));
+        } else {
+          console.log(manualMsg);
+          console.log('--dry-run: exit without syncing.');
+        }
+        return { action: 'stop' };
+      }
+      if (jsonOut) {
+        return { action: 'proceed', autoDeferEmbeds: false, notice: {
+          status: 'manual_drain_required', mode, gate: 'manual_drain_required',
+          reason: manualDrainReason, workerSurface: ctx.workerSurface.status, staleChars, staleCostUsd,
+          capUsd: formatUsdLimit(capUsd), floorUsd: formatUsdLimit(floorUsd),
+          model: embeddingModelName, manualCommands: commands,
+        } };
+      }
+      console.log(manualMsg);
+      return { action: 'proceed', autoDeferEmbeds: false };
+    }
     if (dryRun) {
       if (jsonOut) {
         console.log(JSON.stringify({ status: 'dry_run', mode, gate: 'dry_run', staleChars, staleCostUsd, capUsd: formatUsdLimit(capUsd), floorUsd: formatUsdLimit(floorUsd), queuedBackfills, model: embeddingModelName }));
@@ -443,16 +541,16 @@ export async function runInlineCostGate(
       return { action: 'stop' };
     }
     if (jsonOut) {
-      console.log(JSON.stringify({ status: 'deferred', mode, gate: 'deferred_notice', staleChars, staleCostUsd, capUsd: formatUsdLimit(capUsd), floorUsd: formatUsdLimit(floorUsd), queuedBackfills, model: embeddingModelName }));
-    } else {
-      console.log(deferredMsg);
+      return { action: 'proceed', autoDeferEmbeds: false, notice: { status: 'deferred', mode, gate: 'deferred_notice', staleChars, staleCostUsd, capUsd: formatUsdLimit(capUsd), floorUsd: formatUsdLimit(floorUsd), queuedBackfills, model: embeddingModelName } };
     }
+    console.log(deferredMsg);
     return { action: 'proceed', autoDeferEmbeds: false };
   }
 
   // ── Inline path ───────────────────────────────────────────────
-  const inline = estimateInlineNewTokens(sources, String(CHUNKER_VERSION), {
+  const inline = estimateInlineNewTokens(sources, chunkerStamp(), {
     forceFullTree: ctx.includeGitignored === true,
+    chunkerDriftWalks: full === true || !(await readManagedMode(engine).catch(() => false)),
   });
   // D7A: `--full` runs `performFullSync` → `runEmbedCore({stale:true})`, which
   // sweeps the pre-existing stale backlog INLINE on top of the delta. Price it.
@@ -485,10 +583,9 @@ export async function runInlineCostGate(
   // cost isn't the constraint; don't defer).
   if (posture === 'tokenmax') {
     if (jsonOut) {
-      console.log(JSON.stringify({ status: 'proceeding', mode, gate: 'posture_tokenmax', newTokens: inline.tokens, estimateKind: inline.estimateKind, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName, hint: SPEND_HINT }));
-    } else {
-      console.log(`${previewMsg} spend.posture=tokenmax: proceeding (informational). ${SPEND_HINT}`);
+      return { action: 'proceed', autoDeferEmbeds: false, notice: { status: 'proceeding', mode, gate: 'posture_tokenmax', newTokens: inline.tokens, estimateKind: inline.estimateKind, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName, hint: SPEND_HINT } };
     }
+    console.log(`${previewMsg} spend.posture=tokenmax: proceeding (informational). ${SPEND_HINT}`);
     return { action: 'proceed', autoDeferEmbeds: false };
   }
 
@@ -517,25 +614,48 @@ export async function runInlineCostGate(
       }
       return { action: 'proceed', autoDeferEmbeds: false };
     }
-    // Non-TTY or --json: AUTO-DEFER embeds to capped backfill jobs. NEVER exit 2
-    // (the wedged-cron fix). Format splits on the explicit --json flag only.
-    if (jsonOut) {
-      console.log(JSON.stringify({ status: 'auto_deferred', mode, gate: 'auto_deferred_embeds', newTokens: inline.tokens, estimateKind: inline.estimateKind, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName, hint: SPEND_HINT }));
-    } else {
+    // Non-TTY or --json: defer without wedging. Use the background queue only
+    // when it has a drainable worker surface; otherwise report the exact
+    // manual command and never imply that a job was or will be queued.
+    if (manualDrainReason) {
+      const commands = manualDrainCommands(sources);
+      if (jsonOut) {
+        return { action: 'proceed', autoDeferEmbeds: true, notice: {
+          status: 'manual_drain_required', mode, gate: 'manual_drain_required',
+          reason: manualDrainReason, workerSurface: ctx.workerSurface.status, newTokens: inline.tokens,
+          estimateKind: inline.estimateKind, costUsd,
+          floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName,
+          manualCommands: commands, hint: SPEND_HINT,
+        } };
+      }
+      const refusal = manualDrainReason === 'no_worker_surface'
+        ? 'no persistent worker surface is available'
+        : 'automatic backfill submission is disabled by --no-auto-embed';
       console.log(
         `${previewMsg} Exceeds floor $${formatUsdLimit(floorUsd)} in a non-interactive ` +
-        `session — importing now, deferring embeds to capped backfill jobs. ` +
-        `Drain: run the jobs worker or \`gbrain embed --stale\`. Pass --yes to embed inline.\n${SPEND_HINT}`,
+        `session — importing now without embeddings because ${refusal}. Manual drain required: ` +
+        `${commands.map((command) => `\`${command}\``).join(', ')}. ` +
+        `Pass --yes to embed inline.\n${SPEND_HINT}`,
       );
+      return { action: 'proceed', autoDeferEmbeds: true };
     }
+
+    // Worker-backed AUTO-DEFER. NEVER exit 2 (the wedged-cron fix).
+    if (jsonOut) {
+      return { action: 'proceed', autoDeferEmbeds: true, notice: { status: 'auto_deferred', mode, gate: 'auto_deferred_embeds', newTokens: inline.tokens, estimateKind: inline.estimateKind, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName, hint: SPEND_HINT } };
+    }
+    console.log(
+      `${previewMsg} Exceeds floor $${formatUsdLimit(floorUsd)} in a non-interactive ` +
+      `session — importing now, deferring embeds to capped backfill jobs. ` +
+      `Drain: run the jobs worker or \`gbrain embed --stale\`. Pass --yes to embed inline.\n${SPEND_HINT}`,
+    );
     return { action: 'proceed', autoDeferEmbeds: true };
   }
 
   // Below floor → proceed without blocking (kills inline-cron noise).
   if (jsonOut) {
-    console.log(JSON.stringify({ status: 'below_floor', mode, gate: 'below_floor', newTokens: inline.tokens, estimateKind: inline.estimateKind, staleChars, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName }));
-  } else {
-    console.log(`${previewMsg} Below cost gate floor ($${formatUsdLimit(floorUsd)}), proceeding.`);
+    return { action: 'proceed', autoDeferEmbeds: false, notice: { status: 'below_floor', mode, gate: 'below_floor', newTokens: inline.tokens, estimateKind: inline.estimateKind, staleChars, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName } };
   }
+  console.log(`${previewMsg} Below cost gate floor ($${formatUsdLimit(floorUsd)}), proceeding.`);
   return { action: 'proceed', autoDeferEmbeds: false };
 }

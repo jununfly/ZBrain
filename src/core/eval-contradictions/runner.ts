@@ -34,11 +34,13 @@ import { CostTracker, estimateUpperBoundCost } from './cost-tracker.ts';
 import { buildSourceTierBreakdown, classifySlugTier } from './cross-source.ts';
 import { shouldSkipForDateMismatch } from './date-filter.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
+import { resolveTierDefault } from '../model-config.ts';
 import { BudgetTracker, BudgetExhausted } from '../budget/budget-tracker.ts';
 import { judgeContradiction, type JudgeInput, type JudgeOutput } from './judge.ts';
 import { JudgeErrorCollector } from './judge-errors.ts';
 import { buildHotPages } from './severity-classify.ts';
 import { pairToFinding } from './auto-supersession.ts';
+import { isJudgeFailedRun, sumVerdicts } from './run-health.ts';
 import {
   PROMPT_VERSION,
   SCHEMA_VERSION,
@@ -53,7 +55,6 @@ import {
 } from './types.ts';
 
 const DEFAULT_TOP_K = 5;
-const DEFAULT_JUDGE_MODEL = 'anthropic:claude-haiku-4-5';
 const DEFAULT_MAX_PAIR_CHARS = 1500;
 
 /** Caller-supplied judge function signature; defaults to judgeContradiction. */
@@ -117,8 +118,12 @@ function searchResultToMember(r: SearchResult): PairMember {
     text: r.chunk_text,
     // Lane A1: effective_date carried through from the search projection.
     // null when the page has no temporal anchor (judge will see `(date unknown)`).
-    effective_date: r.effective_date ?? null,
-    effective_date_source: r.effective_date_source ?? null,
+    // N2-1: a 'fallback' (or unlabeled) date is the page's recorded time, not a
+    // temporal anchor — passing it on made the date filter never skip and let
+    // temporal_supersede name the wrong side. Same rule as deriveTimelineAnchor.
+    ...(r.effective_date && r.effective_date_source && r.effective_date_source !== 'fallback'
+      ? { effective_date: r.effective_date, effective_date_source: r.effective_date_source }
+      : { effective_date: null, effective_date_source: null }),
   };
 }
 
@@ -269,7 +274,10 @@ export async function runContradictionProbe(opts: RunnerOpts): Promise<RunnerRes
 
 async function _runContradictionProbeInner(opts: RunnerOpts): Promise<RunnerResult> {
   const startedAt = Date.now();
-  const judgeModel = opts.judgeModel ?? DEFAULT_JUDGE_MODEL;
+  // #3813: key-aware tier default, not a hardcoded Anthropic model — an
+  // OPENAI_API_KEY-only install must not route the judge to an unservable
+  // provider.
+  const judgeModel = opts.judgeModel ?? resolveTierDefault('utility');
   const topK = Math.max(1, opts.topK ?? DEFAULT_TOP_K);
   const sampling = opts.sampling ?? 'deterministic';
   const budgetUsd = opts.budgetUsd ?? 5.0;
@@ -447,8 +455,16 @@ async function _runContradictionProbeInner(opts: RunnerOpts): Promise<RunnerResu
   const runId = new Date(startedAt).toISOString().replace(/[:.]/g, '-').replace(/-(?=\d{3}Z$)/, '.');
   const durationMs = Date.now() - startedAt;
 
+  // #3889: a run where EVERY judge call errored has zero verdicts — its
+  // "0 contradictions" headline is untrustworthy. Stamp the status so the
+  // CLI + doctor can refuse to render it as a clean green result.
+  const runStatus = isJudgeFailedRun(sumVerdicts(verdictBreakdown), judgeErrors.total)
+    ? ('judge_failed' as const)
+    : ('ok' as const);
+
   const report: ProbeReport = {
     schema_version: SCHEMA_VERSION,
+    run_status: runStatus,
     run_id: runId,
     judge_model: judgeModel,
     prompt_version: PROMPT_VERSION,

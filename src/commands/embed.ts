@@ -1,14 +1,39 @@
+import { jsonRequested } from '../core/cli-force-exit.ts';
+import { prepareProseChunks } from '../core/markdown-chunks.ts';
+import type { FenceChunkOverlay } from '../core/eligibility/fence-overlay.ts';
+import { prepareEmbeddingProjections, countArchivedEmbeddingWork, reportBlockedProjections } from '../core/embedding-readiness.ts';
+import { embedStaleFacts, type EmbedFactsResult } from '../core/embed-facts.ts';
+import { embedTakesForStaleDrain, type EmbedTakesResult } from '../core/embed-takes.ts';
+import { parseFactEmbedArgs } from './embed-facts-delegate.ts';
+import { readProjectionSnapshot, installPageProjection, installPageEmbeddings, PageProjectionConflictError, retryProjectionConflict } from '../core/page-state/projections.ts';
+import { projectionConflictLine } from '../core/agent-output.ts';
+import { withChunkStatisticsRefresh } from '../core/search/projection-statistics.ts';
+import { PageRevisionConflictError } from '../core/page-state/types.ts';
 import type { BrainEngine } from '../core/engine.ts';
-import { embedBatch, currentEmbeddingSignature } from '../core/embedding.ts';
+import { currentEmbeddingSignature } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
-import { carryChunkMetadata } from '../core/embed-stale.ts';
-import { chunkText } from '../core/chunkers/recursive.ts';
+import { carryChunkMetadata, probeEmbedder, resolveProvenanceStamp, stampIfPageProvenanceComplete } from '../core/embed-stale.ts';
+import type { StaleImageSweepResult } from '../core/embed-stale-images.ts';
+import { resolveMaxChunkTokens } from '../core/embedding-input-limit.ts';
+import { healOversizedPageChunks, healedChunksToStaleRows } from '../core/embed-oversize-heal.ts';
+import { healAndReportOverLength, isSingleInputOverLengthError, statusFromCause } from '../core/embed-overlength-heal.ts';
+import {
+  createEmbedStallWatchdog,
+  resolveEmbedStallAbortSeconds,
+  EMBED_STALL_CLEANUP_DEADLINE_MS, type EmbedStallInfo,
+} from '../core/embed-stall.ts';
 import { createProgress, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { StaleChunkProgress } from '../core/embed-stale-progress.ts';
 import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
-import { loadConfig } from '../core/config.ts';
+import { writeCliError } from '../cli/cli-error.ts';
+import { countRestampOnlyChunks, invalidateStaleSignatureEmbeddingsGuarded } from '../core/embedding-invalidation.ts';
+import { loadConfig, type GBrainConfig } from '../core/config.ts';
 import { slog, serr } from '../core/console-prefix.ts';
-import { filterOutEmbedSkipped } from '../core/embed-skip.ts';
+import { embedBudgetStopVerdict, noteEmbedBudgetStop } from '../core/embed-budget-stop.ts';
+import { embedCostCap, embedCostStopVerdict, noteEmbedCostStop } from '../core/embed-cost-cap.ts';
+import type { Authorization } from '../core/consent.ts';
+import { filterOutEmbedSkipped, isEmbedSkipped } from '../core/embed-skip.ts';
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { isAborted, anySignal, AbortError } from '../core/abort-check.ts';
 import { type DbPacer, createDbPacer, createNoopPacer, observed } from '../core/db-pacer.ts';
@@ -21,12 +46,52 @@ import {
 import { tryAcquireDbLock, type DbLockHandle } from '../core/db-lock.ts';
 import { embedBackfillLockId } from '../core/embed-backfill-lock.ts';
 import { AITransientError } from '../core/ai/errors.ts';
+import { resolveEmbedConcurrency } from '../core/embed-concurrency.ts';
+export { resolveEmbedConcurrency, _resetEmbedConcurrencyClampWarningForTest } from '../core/embed-concurrency.ts';
+import { isEmbeddingZeroNormError } from '../core/ai/embedding-guard.ts';
 import { wrapChunkTextsForStoredMode } from '../core/embedding-context.ts';
-import { titleTierCorpusGeneration } from '../core/contextual-retrieval-service.ts';
-import type { Page } from '../core/types.ts';
+import { meterPageBatch, spendGrant } from '../core/page-embedding-budget.ts';
+import { heldApprovalUsd, heldEmbedArgv } from '../core/held-embedding.ts';
+import { countSegmentedEmbedRows, embedSegmentedPage, readSealedSegmentedEmbedPage, readSegmentedEmbedPage, type SegmentedEmbedPage } from '../core/page-body/segmented-embedding.ts';
+import {
+  restampIfDemotedToTitleTier,
+  embedBatchWithBackoff,
+  embedBatchKeepingUsable,
+  isEmbedRetriableError,
+  isTransientNetworkEmbedError,
+  type EmbedBatchWithBackoffOpts,
+} from '../core/embed-retry.ts';
+
+// Peeled to src/core/embed-retry.ts (core→commands layering fix: core modules
+// import-file.ts / embed-stale.ts consume these, and a commands module in
+// their value closure risks a real ESM cycle). Façade rule: embed.ts keeps
+// re-exporting its historical surface so import sites and tests never chase
+// the peel.
+export {
+  restampIfDemotedToTitleTier,
+  MAX_RATE_LIMIT_RETRIES,
+  RATE_LIMIT_FALLBACK_MS,
+  RATE_LIMIT_PAD_MS,
+  RATE_LIMIT_JITTER,
+  detect429FromCause,
+  detectGatewayErrorFromCause,
+  parseRetryDelayMs,
+  RATE_LIMIT_ATTEMPT_FLOOR_MS,
+  _setRateLimitFloorsForTests,
+  rateLimitDelayMs,
+  abortableSleep,
+  embedBatchWithBackoff,
+  TRANSIENT_NET_BASE_MS,
+  TRANSIENT_NET_MAX_MS,
+  transientBackoffMs,
+  isTransientNetworkEmbedError,
+} from '../core/embed-retry.ts';
+export type { EmbedBatchWithBackoffOpts } from '../core/embed-retry.ts';
 
 /** #3037: cap failure samples so a corpus-wide outage doesn't bloat --json. */
 const FAILURE_SAMPLE_CAP = 10;
+const DEFAULT_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS = 30_000;
+const EMBED_UNAVAILABLE_MESSAGE = 'Page or source is unavailable or changed; no embeddings were installed. An archived source requires deliberate gbrain sources restore <id>; inspect the page and source before retrying.';
 
 /**
  * #3037: record embed failures on the run result. `chunkCount` is the number
@@ -36,27 +101,47 @@ const FAILURE_SAMPLE_CAP = 10;
 function recordFailure(result: EmbedResult, chunkCount: number, slug: string, e: unknown): void {
   result.failures += chunkCount;
   if (result.failure_samples.length < FAILURE_SAMPLE_CAP) {
-    result.failure_samples.push(`${slug}: ${e instanceof Error ? e.message : String(e)}`);
+    const fix = isEmbeddingZeroNormError(e) ? ` ${e.suggestionFor(slug)}` : '';
+    result.failure_samples.push(`${slug}: ${projectionConflictLine(e, 'embed') ?? `${e instanceof Error ? e.message : String(e)}${fix}`}`);
   }
 }
 
 /**
- * #3507 — after a plain re-embed fully re-embedded a `per_chunk_synopsis`
- * page at the title-only tier (see wrapChunkTextsForStoredMode), restamp the
- * page's CR state to 'title' so `contextual_retrieval_mode` keeps describing
- * the vectors actually in the column. The reindex sweep restores the synopsis
- * tier later. No-op for every other mode.
+ * #3622: failure quarantine for the --stale path. A page whose embed makes
+ * NO progress keeps all its NULL chunks, so every stale pass re-sends the
+ * identical request — a page that fails deterministically (e.g. always
+ * outlives a local server's timeout) is retried forever, and against a
+ * serial embedding server (ollama `-np 1`) the abandoned work compounds
+ * into congestion collapse. After GBRAIN_EMBED_QUARANTINE_AFTER consecutive
+ * zero-progress attempts (default 3) a page is skipped for the rest of this
+ * process; an attempt that embeds ANY chunk resets its counter (#3037
+ * partial progress shrinks the stale set, so the next pass sends a smaller
+ * request, not the identical doomed one). Process-lifetime by design: a
+ * long-lived autopilot stops re-sending doomed pages every cycle, while a
+ * restart (or frontmatter.embed_skip for a permanent block) lets the
+ * operator retry deliberately. Keyed `${source_id}::${slug}` to match the
+ * stale-batch grouping.
  */
-export async function restampIfDemotedToTitleTier(
-  engine: BrainEngine,
-  page: Pick<Page, 'contextual_retrieval_mode'> | null | undefined,
-  slug: string,
-  sourceId: string,
-): Promise<void> {
-  if (page?.contextual_retrieval_mode !== 'per_chunk_synopsis') return;
-  await engine.updatePageContextualRetrievalState(slug, sourceId, 'title', titleTierCorpusGeneration());
+const _embedFailureCounts = new Map<string, number>();
+
+/** Test seam: clear quarantine state between test runs. */
+export function _resetEmbedQuarantineForTest(): void {
+  _embedFailureCounts.clear();
 }
 
+function embedQuarantineThreshold(): number {
+  const raw = parseInt(process.env.GBRAIN_EMBED_QUARANTINE_AFTER || '3', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 3;
+}
+
+/** #3622: count a zero-progress attempt; announce the page's quarantine once. */
+function noteEmbedQuarantineFailure(key: string, slug: string): void {
+  const failures = (_embedFailureCounts.get(key) ?? 0) + 1;
+  _embedFailureCounts.set(key, failures);
+  if (failures === embedQuarantineThreshold()) {
+    serr(`\n  [embed] ${slug}: ${failures} consecutive failed attempt(s) — quarantined for the rest of this process`);
+  }
+}
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
   all?: boolean;
@@ -66,6 +151,8 @@ export interface EmbedOpts {
   slugs?: string[];
   /** Embed a single page. */
   slug?: string;
+  /** The user's `--max-usd N` on a foreground `--slugs`/`--held` run: lifts a large page's hold and raises its per-page cap by N. */
+  approvedPageCapUsd?: number;
   /**
    * v0.31.12: scope to a specific source. When set, only pages from this
    * source are embedded. When omitted, all sources are processed (but
@@ -172,6 +259,13 @@ export interface EmbedOpts {
    * function refreshes them (heartbeat) but never releases them.
    */
   heldLocks?: DbLockHandle[];
+  assertOwned?: (tx?: BrainEngine) => Promise<void>;
+  /**
+   * #5885: a `stale` drain also embeds stale takes (missing, claim-drifted or
+   * other-model vectors). Unset follows `takes.auto_embed` / GBRAIN_EMBED_TAKES
+   * (default on); the embedding-model migration drain passes true.
+   */
+  takes?: boolean;
 }
 
 /**
@@ -189,6 +283,8 @@ export interface EmbedResult {
   skipped: number;
   /** Chunks that would be embedded if not for dryRun (0 in non-dryRun). */
   would_embed: number;
+  /** #5289 dryRun: signature-stale chunks whose current-space vectors are only restamped. */
+  would_restamp?: number;
   /** Total chunks considered across all processed pages. */
   total_chunks: number;
   /** Number of pages processed (whether or not they had stale chunks). */
@@ -207,6 +303,12 @@ export interface EmbedResult {
    * corpus-wide outage doesn't bloat structured output. Additive field.
    */
   failure_samples: string[];
+  /**
+   * SUP-3874 heals performed this run (oversized chunks split in place).
+   * Also feeds the stall watchdog's progress key: a mass-heal prelude is
+   * real forward progress, so it must not read as a stall. Additive field.
+   */
+  healed_splits?: number;
   /** True if this run was a dry-run. */
   dryRun: boolean;
   /**
@@ -225,6 +327,8 @@ export interface EmbedResult {
    * misreporting embed failures.
    */
   lock_skipped?: boolean;
+  /** #6529: the image sweep a `--stale` run on a multimodal install made before its text drain (core/embed-stale-images.ts). */
+  images?: StaleImageSweepResult;
   /**
    * Set when the single-flight lock heartbeat discovered the lock was stolen
    * (refresh matched 0 rows) or kept erroring: mutual exclusion is gone, so
@@ -251,6 +355,26 @@ export interface EmbedResult {
     /** High-water mark of acquirers blocked on the permit (sync path). */
     maxWaiters: number;
   };
+  /**
+   * #4599: set when the progress-keyed stall watchdog aborted the drain (no
+   * successful embed progress for GBRAIN_EMBED_STALL_ABORT_SECONDS). The
+   * watchdog already released the single-flight locks and flushed the
+   * summary; partial progress is banked and the run is resumable. Error
+   * RESULT, not a throw (X6): the CLI wrapper maps it to a non-zero exit;
+   * minion handlers throw via `assertEmbedNotStalled` to fail the job.
+   * `failures`/`failure_samples` also carry a stall entry so existing
+   * failures>0 consumers surface it unchanged.
+   */
+  reason?: 'stall_timeout' | 'time_budget' | 'cost_cap';
+  /** With `reason: 'time_budget'` (src/core/embed-budget-stop.ts): stale chunks left and the command that finishes them. */
+  remaining_stale?: number;
+  resume_command?: string;
+  /** With `reason: 'cost_cap'` (src/core/embed-cost-cap.ts): the approved cap, what the run spent, and the refusal's reason. */
+  cap_usd?: number;
+  spent_usd?: number;
+  budget_reason?: string;
+  /** #5885: the takes pass of a `stale` drain, when it ran. Its failures are also counted in `failures`. */
+  takes?: EmbedTakesResult;
 }
 
 /**
@@ -359,7 +483,7 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
     for (const s of opts.slugs) {
       if (isAborted(opts.signal)) break; // #1737: stop the per-slug loop on abort
       try {
-        await embedPage(engine, s, !!opts.dryRun, result, opts.sourceId, opts.signal, opts.quiet);
+        await embedPage(engine, s, !!opts.dryRun, result, opts.sourceId, opts.signal, opts.quiet, opts.approvedPageCapUsd);
       } catch (e: unknown) {
         if (isAborted(opts.signal)) break; // shutdown, not a failure
         // #3037: a page-level error (not found, DB write) must not exit 0.
@@ -436,10 +560,25 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
     const activeLocks: DbLockHandle[] = callerHeld ? [...(opts.heldLocks ?? [])] : sfLocks;
     const lockAbort = new AbortController();
     let heartbeat: ReturnType<typeof setInterval> | undefined;
+    let heartbeatTickAbort: AbortController | undefined;
+    let stoppingHeartbeat = false;
+    const stopHeartbeat = (): void => {
+      stoppingHeartbeat = true;
+      if (heartbeat !== undefined) {
+        clearInterval(heartbeat);
+        heartbeat = undefined;
+      }
+      if (heartbeatTickAbort && !heartbeatTickAbort.signal.aborted) {
+        heartbeatTickAbort.abort();
+      }
+    };
     // Test seam: default 5 min; tests shrink it to exercise the loss path.
     const heartbeatMs = Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS) > 0
       ? Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_MS)
       : 5 * 60 * 1000;
+    const heartbeatTimeoutMs = Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS) > 0
+      ? Number(process.env.GBRAIN_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS)
+      : DEFAULT_EMBED_LOCK_HEARTBEAT_TIMEOUT_MS;
     if (activeLocks.length > 0 && !opts.dryRun) {
       let consecutiveErrors = 0;
       let beating = false;
@@ -447,32 +586,51 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
         if (beating) return; // a slow tick must not stack
         beating = true;
         void (async () => {
+          const tickAbort = new AbortController();
+          heartbeatTickAbort = tickAbort;
+          let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<never>((_, reject) => {
+            timeoutTimer = setTimeout(() => {
+              tickAbort.abort();
+              reject(new Error('refresh_timeout'));
+            }, heartbeatTimeoutMs);
+            (timeoutTimer as unknown as { unref?: () => void }).unref?.();
+          });
           try {
             if (lockAbort.signal.aborted) return;
             for (const h of activeLocks) {
-              const ok = await h.refresh();
+              const ok = await Promise.race([h.refresh({ signal: tickAbort.signal }), timeout]);
               if (!ok) {
                 result.lock_lost = true;
                 serr('  [embed] single-flight lock was stolen or released mid-run; aborting the drain (partial progress is banked — re-run to resume).');
-                if (heartbeat !== undefined) clearInterval(heartbeat);
+                stopHeartbeat();
                 lockAbort.abort();
                 return;
               }
             }
             consecutiveErrors = 0;
           } catch {
+            if (stoppingHeartbeat) return;
             consecutiveErrors += 1;
             if (consecutiveErrors >= 3) {
               result.lock_lost = true;
               serr('  [embed] lock heartbeat failed 3 consecutive times; aborting the drain rather than running without mutual exclusion.');
-              if (heartbeat !== undefined) clearInterval(heartbeat);
+              stopHeartbeat();
               lockAbort.abort();
             }
           } finally {
+            if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+            if (heartbeatTickAbort === tickAbort) heartbeatTickAbort = undefined;
             beating = false;
           }
         })();
       }, heartbeatMs);
+      // Deliberately NOT unref'd: if the drain promise is lost (#4599 class),
+      // the referenced interval keeps the process alive as a LOUD hang instead
+      // of a silent exit-0 that leaks the single-flight locks. The per-tick
+      // timeout timer above IS unref'd — the interval already anchors the
+      // event loop, so the 30s tick timeout must not extend process lifetime
+      // past stopHeartbeat().
     }
     const drainSignal = anySignal(lockAbort.signal, opts.signal);
 
@@ -510,50 +668,157 @@ export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promis
         pacer = createNoopPacer();
       }
     }
-    try {
-      await embedAll(engine, !!opts.stale, !!opts.dryRun, result, opts.onProgress, opts.sourceId, {
-        batchSize: opts.batchSize,
-        priority: opts.priority,
-        catchUp: opts.catchUp,
-        pacer,
-        paceMaxConcurrency,
-        quiet: opts.quiet,
-        includeNullSignature: opts.includeNullSignature,
-      }, drainSignal);
-    } catch (e) {
-      // A heartbeat-triggered abort is a clean, resumable stop (lock_lost is
-      // already set + explained on stderr) — not an error to propagate.
-      if (!(result.lock_lost && e instanceof AbortError)) throw e;
-    } finally {
-      if (heartbeat !== undefined) clearInterval(heartbeat);
-      // E1: surface pacing telemetry (human + structured) when pacing was on.
-      const snap = pacer.snapshot();
-      if (snap.enabled) {
-        result.pacing = {
-          maxConcurrency: snap.maxConcurrency,
-          samples: snap.sampleCount,
-          ewmaMs: snap.ewmaMs,
-          totalSleptMs: snap.totalSleptMs,
-          sleeps: snap.sleepCount,
-          maxWaiters: snap.maxWaiters,
-        };
-        serr(
-          `  [embed] pacing: cap=${snap.maxConcurrency} samples=${snap.sampleCount} ` +
-            `ewma=${snap.ewmaMs === null ? 'n/a' : Math.round(snap.ewmaMs) + 'ms'} ` +
-            `slept=${snap.totalSleptMs}ms/${snap.sleepCount}`,
-        );
-      }
-      pacer.dispose();
+    // Shared end-of-drain cleanup: heartbeat stop, pacing summary flush,
+    // single-flight lock release (self-acquired only — caller-held locks stay
+    // with the caller per the heldLocks contract). Idempotent so the normal
+    // drain finally and the #4599 stall watchdog path can both call it: the
+    // stall path must never rely on a dead drain's finally (X5), and a
+    // late-resolving drain must not double-release after the watchdog cleaned
+    // up. Never throws (all steps best-effort).
+    let drainCleanupDone = false;
+    const flushAndRelease = async (): Promise<void> => {
+      if (drainCleanupDone) return;
+      drainCleanupDone = true;
+      stopHeartbeat();
+      try {
+        // E1: surface pacing telemetry (human + structured) when pacing was on.
+        const snap = pacer.snapshot();
+        if (snap.enabled) {
+          result.pacing = {
+            maxConcurrency: snap.maxConcurrency,
+            samples: snap.sampleCount,
+            ewmaMs: snap.ewmaMs,
+            totalSleptMs: snap.totalSleptMs,
+            sleeps: snap.sleepCount,
+            maxWaiters: snap.maxWaiters,
+          };
+          serr(
+            `  [embed] pacing: cap=${snap.maxConcurrency} samples=${snap.sampleCount} ` +
+              `ewma=${snap.ewmaMs === null ? 'n/a' : Math.round(snap.ewmaMs) + 'ms'} ` +
+              `slept=${snap.totalSleptMs}ms/${snap.sleepCount}`,
+          );
+        }
+        pacer.dispose();
+      } catch { /* telemetry must never block cleanup */ }
       // E-2: release single-flight locks (reverse order). Best-effort; the
       // lock TTL is the backstop if a release fails.
       for (const h of sfLocks.reverse()) {
         try { await h.release(); } catch { /* best-effort; TTL covers it */ }
       }
+    };
+
+    // #4599: progress-keyed stall watchdog (mirror of sync's #1950 — see
+    // src/core/embed-stall.ts for the two-clock design and the operator
+    // notes). Armed for real drains only; dryRun never embeds so "no
+    // successful progress" is its normal state, and 0/negative disables.
+    let takesEmbedded = 0;
+    const stallSeconds = opts.dryRun ? 0 : resolveEmbedStallAbortSeconds();
+    const watchdog = stallSeconds > 0
+      ? createEmbedStallWatchdog({
+          thresholdSeconds: stallSeconds,
+          // Heals count as forward progress: a corpus-wide oversize-heal
+          // prelude (thousands of getChunks+upsertChunks before the first
+          // embed) is healthy work, not a stall — without this it would
+          // abort deterministically at the same point on every resume.
+          readProgress: () => result.embedded + (result.healed_splits ?? 0) + takesEmbedded,
+        })
+      : undefined;
+
+    // The drain runs as a captured promise so the watchdog can RACE it: a
+    // wedged drain (#4599 class — lost promise, abort-ignoring HTTP call)
+    // never returns, so awaiting it directly would also never return. Errors
+    // are captured, not thrown, so a post-stall late rejection can never
+    // become an unhandled rejection.
+    let drainError: { err: unknown } | undefined;
+    const drain = (async () => {
+      try {
+        await withChunkStatisticsRefresh(engine, () => !opts.dryRun && result.embedded > 0 && !isAborted(drainSignal), () => embedAll(engine, !!opts.stale, !!opts.dryRun, result, opts.onProgress, opts.sourceId, {
+          batchSize: opts.batchSize,
+          priority: opts.priority,
+          catchUp: opts.catchUp,
+          pacer,
+          paceMaxConcurrency,
+          quiet: opts.quiet,
+          includeNullSignature: opts.includeNullSignature,
+          assertOwned: opts.assertOwned,
+        }, drainSignal));
+        if (opts.stale && !isAborted(drainSignal)) await embedTakesForStaleDrain(engine, {
+          dryRun: !!opts.dryRun, signal: drainSignal, sourceId: opts.sourceId, assertOwned: opts.assertOwned, quiet: opts.quiet,
+          takes: opts.takes, onProgress: (_done, _total, embedded) => { takesEmbedded = embedded; },
+        }, result);
+      } catch (e) {
+        // A heartbeat-triggered abort is a clean, resumable stop (lock_lost is
+        // already set + explained on stderr) — not an error to propagate.
+        if (!(result.lock_lost && e instanceof AbortError)) drainError = { err: e };
+      } finally {
+        await flushAndRelease();
+      }
+    })();
+
+    if (!watchdog) {
+      await drain;
+      if (drainError) throw drainError.err;
+      return result;
     }
+    let outcome: 'drained' | 'stalled';
+    let stallInfo: EmbedStallInfo | undefined;
+    try {
+      outcome = await Promise.race([
+        drain.then(() => 'drained' as const),
+        watchdog.stalled.then((info) => {
+          stallInfo = info;
+          return 'stalled' as const;
+        }),
+      ]);
+    } finally {
+      watchdog.stop();
+    }
+    if (outcome === 'drained') {
+      if (drainError) throw drainError.err;
+      return result;
+    }
+
+    // Stall fired. The drain may be dead — perform the watchdog's OWN bounded
+    // cleanup (X5/T5) instead of waiting on the drain's finally: abort
+    // whatever is still listening, release the single-flight locks via the
+    // direct engine-backed handles, flush the summary, and return an error
+    // RESULT (X6 — no process.exit below the CLI layer). If cleanup itself
+    // wedges (same dead pool), the ~10s deadline forces the return and the
+    // lock TTL is the backstop. A late-resolving drain finds
+    // drainCleanupDone=true and skips.
+    const apiNote = stallInfo?.msSinceLastApiResponse == null
+      ? 'no embedding-API responses observed this run (drain wedged before/inside a call)'
+      : `last embedding-API response ${Math.round(stallInfo.msSinceLastApiResponse / 1000)}s ago ` +
+        '(alive but not succeeding — retry storms trip this by design)';
+    serr(
+      `  [embed] no successful embed progress for ${stallSeconds}s — aborting (stall watchdog, refs #4599); ${apiNote}. ` +
+        `Partial progress is banked (embedded=${result.embedded}); single-flight locks released; re-run to resume. ` +
+        'Tune via GBRAIN_EMBED_STALL_ABORT_SECONDS (0 disables).',
+    );
+    lockAbort.abort();
+    // Deadline timer is REFERENCED on purpose: after stop()/stopHeartbeat it
+    // may be the only live handle — unref'ing it could let a wedged cleanup
+    // become a silent exit-0 instead of reaching the force path.
+    let cleanupDeadline: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      flushAndRelease(),
+      new Promise<void>((r) => { cleanupDeadline = setTimeout(r, EMBED_STALL_CLEANUP_DEADLINE_MS); }),
+    ]);
+    if (cleanupDeadline !== undefined) clearTimeout(cleanupDeadline);
+    if (!drainCleanupDone) {
+      serr('  [embed] stall cleanup exceeded its deadline; lock TTL is the release backstop.');
+    }
+    recordFailure(
+      result,
+      1,
+      '<stall-watchdog>',
+      new Error(`stall_timeout: no successful embed progress for ${stallSeconds}s`),
+    );
+    result.reason = 'stall_timeout';
     return result;
   }
   if (opts.slug) {
-    await embedPage(engine, opts.slug, !!opts.dryRun, result, opts.sourceId, opts.signal, opts.quiet);
+    await embedPage(engine, opts.slug, !!opts.dryRun, result, opts.sourceId, opts.signal, opts.quiet, opts.approvedPageCapUsd);
     return result;
   }
   throw new Error('No embed target specified. Pass { slug }, { slugs }, { all }, or { stale }.');
@@ -615,17 +880,30 @@ export function isKeylessStaleRefusal(args: string[], embeddingDisabled: boolean
     && embeddingDisabled === true;
 }
 
-export async function runEmbed(engine: BrainEngine, args: string[]): Promise<EmbedResult | undefined> {
+/** The `--slugs` list: the arguments after it up to the next flag, so `--slugs a b --max-usd 1` never reads `1` as a slug. */
+function slugsAfter(args: readonly string[], at: number): string[] {
+  const end = args.findIndex((a, i) => i > at && a.startsWith('--'));
+  return args.slice(at + 1, end < 0 ? undefined : end);
+}
+
+export async function runEmbed(engine: BrainEngine, args: string[], selectedConfig: GBrainConfig | null = null,
+  /** The CLI's consent outcome (src/cli/commands/embed.ts); its cap meters the run (fix wave 13 P1.18). */
+  consent: { authorization: Authorization | null } | null = null): Promise<EmbedResult | EmbedFactsResult | StaleImageSweepResult | undefined> {
+  if (args.includes('--facts')) {
+    const result = await embedStaleFacts(engine, parseFactEmbedArgs(args), selectedConfig);
+    if (!jsonRequested(args)) console.log(JSON.stringify(result, null, 2));
+    return result;
+  }
   // Keyless clean refusal — see isKeylessStaleRefusal. Checked BEFORE the
   // background block so we never queue a job that can only fail. stderr only;
   // stdout stays empty like every other embed outcome (embed has no JSON
   // result surface — do not invent one here).
-  if (isKeylessStaleRefusal(args, loadConfig()?.embedding_disabled)) {
-    process.stderr.write(
-      '[embed] Embeddings are disabled on this brain (keyless install). '
-      + 'Nothing to backfill; keyword search keeps working. '
-      + 'Enable later: set embedding_model via gbrain config, then re-run gbrain init with the force flag.\n',
-    );
+  const keylessConfig = loadConfig();
+  if (isKeylessStaleRefusal(args, keylessConfig?.embedding_disabled)) {
+    const enable = (await import('../core/readiness.ts')).embeddingEnablement(keylessConfig!).argv ?? ['gbrain', 'init', '--force', '--embedding-model', '<provider:model>'];
+    process.stderr.write('[embed] Embeddings are disabled on this brain (keyless install), so there are no vectors to compute. Keyword search covers every chunked page; '
+      + 'pages an older version skipped for size become keyword-searchable with gbrain reindex --oversized (free). '
+      + `Turn on semantic search (pages and facts are kept): ${(await import('../core/agent-output.ts')).shellQuote(enable)}\n`);
     return {
       embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0,
       pages_processed: 0, failures: 0, failure_samples: [], dryRun: false,
@@ -633,10 +911,18 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
     };
   }
 
+  if (args.includes('--held')) {
+    const held = await heldEmbedArgv(engine, args, currentEmbeddingSignature(), args.includes('--json') ? serr : slog);
+    return 'argv' in held ? runEmbed(engine, held.argv, selectedConfig, consent) : held;
+  }
+  const authorization = consent?.authorization ?? null;
+  const costCap = args.includes('--dry-run') || args.includes('--background') ? null : embedCostCap(authorization?.cap_usd, authorization?.cap_source);
+  if (args.includes('--images')) return (await import('../core/embed-stale-images.ts')).runEmbedStaleImagesCli(engine, args, costCap); // lazy: keeps import-file out of embed's graph
   // v0.36+ T7: --background submits via Minion queue, returns job_id to
   // stdout, exits. Same semantics in TTY and cron (D9).
   if (args.includes('--background')) {
     const { maybeBackground } = await import('../core/cli-options.ts');
+    const { jobSpendAuthorization } = await import('../core/minions/spend-authorization.ts');
     const backgrounded = await maybeBackground({
       engine,
       args,
@@ -651,7 +937,7 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
           all: cleanArgs.includes('--all'),
           stale: cleanArgs.includes('--stale'),
           dryRun: cleanArgs.includes('--dry-run'),
-          slugs: slugsI >= 0 ? cleanArgs.slice(slugsI + 1).filter(a => !a.startsWith('--')) : undefined,
+          slugs: slugsI >= 0 ? slugsAfter(cleanArgs, slugsI) : undefined,
           sourceId: srcI >= 0 ? cleanArgs[srcI + 1] : undefined,
           // Background parity (D7): these four used to be silently DROPPED,
           // degrading the documented recovery command to a plain stale run.
@@ -666,9 +952,12 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
         };
       },
       source: 'cli',
+      // Fix wave 13 P1.18: the approval travels on the row; the worker meters the job under its cap.
+      ...(authorization ? { spendAuthorization: jobSpendAuthorization(authorization, { command: 'embed', of: 1, argv: ['gbrain', 'embed', ...args.filter(a => a !== '--yes')] }) } : {}),
     });
     if (backgrounded) return;
-    // PGLite degraded to inline — fall through.
+    // PGLite runs inline: meter it like any foreground run.
+    return runEmbed(engine, args.filter(a => a !== '--background'), selectedConfig, consent);
   }
 
   const slugsIdx = args.indexOf('--slugs');
@@ -692,14 +981,15 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
 
   let opts: EmbedOpts;
   if (slugsIdx >= 0) {
-    opts = { slugs: args.slice(slugsIdx + 1).filter(a => !a.startsWith('--')), dryRun, sourceId, batchSize, priority, catchUp };
+    const approvedPageCapUsd = await heldApprovalUsd(engine, args);
+    opts = { slugs: slugsAfter(args, slugsIdx), dryRun, sourceId, batchSize, priority, catchUp, ...(approvedPageCapUsd !== undefined && { approvedPageCapUsd }) };
   } else if (all || stale) {
     // E-2: CLI-only single-flight for stale runs (the minion path locks itself).
     opts = { all, stale, dryRun, sourceId, batchSize, priority, catchUp, ...(pace && { pace }), ...(stale && { singleFlight: true }), ...(includeNullSignature && { includeNullSignature: true }) };
   } else {
     const slug = args.find(a => !a.startsWith('--'));
     if (!slug) {
-      serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...] [--dry-run] [--batch-size N] [--priority recent] [--catch-up] [--include-null-signature]');
+      serr('Usage: gbrain embed [<slug>|--all|--stale|--slugs s1 s2 ...|--held] [--dry-run] [--batch-size N] [--priority recent] [--catch-up] [--include-null-signature] [--yes | --max-usd N] | --stale --images (gbrain embed --help: paid runs need the user\'s approval)');
       process.exit(1);
     }
     opts = { slug, dryRun, sourceId, batchSize, priority, catchUp };
@@ -709,27 +999,53 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   // all work. Minion handlers call runEmbedCore directly with their own
   // onProgress (see jobs.ts).
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
-  let progressStarted = false;
-  opts.onProgress = (done, total, _embedded) => {
-    if (!progressStarted) {
-      progress.start('embed.pages', total);
-      progressStarted = true;
-    }
-    progress.tick(1);
+  let progressDone: number | null = null;
+  opts.onProgress = (done, total) => {
+    if (progressDone === null) progress.start('embed.pages', total); else progress.setTotal?.(total);
+    progress.tick(done - (progressDone ?? 0)); progressDone = done;
   };
 
+  if (costCap) opts.signal = costCap.signal;
   try {
-    const result = await runEmbedCore(engine, opts);
-    if (progressStarted) progress.finish();
+    // #6529: a multimodal install rebuilds its image pages first, inside the same cap (lazy: keeps import-file out of embed's graph).
+    const images = stale && slugsIdx < 0 ? await (await import('../core/embed-stale-images.ts')).runStaleImageSweepFirst(engine, { sourceId, dryRun, costCap }) : null;
+    const result = (await import('../core/embed-stale-images.ts')).foldImageSweep(costCap ? await costCap.metered(() => runEmbedCore(engine, opts)) : await runEmbedCore(engine, opts), images);
+    if (progressDone !== null) progress.finish();
+    const capped = costCap?.hit();
+    if (capped) {
+      noteEmbedCostStop(result, capped, args);
+      (args.includes('--json') ? serr : slog)(embedCostStopVerdict(result, capped));
+      return result;
+    }
     // #3037: loud end-of-run summary so failures are visible even when the
     // per-page stderr lines scrolled away. cli.ts turns failures>0 into a
     // non-zero exit verdict.
     if (result.failures > 0) {
       serr(`[embed] ${result.failures} chunk(s) failed to embed. First error: ${result.failure_samples[0] ?? 'unknown'}`);
     }
+    // #4599 (X6): the stall watchdog returns an error RESULT from core; ONLY
+    // this CLI wrapper maps it to a hard non-zero process exit. Hard exit on
+    // purpose: the wedged drain may hold handles that would keep an exited-
+    // verdict process alive forever. The watchdog already released the
+    // single-flight locks and flushed the summary.
+    if (result.reason === 'stall_timeout') {
+      serr('[embed] exiting non-zero: stall watchdog aborted the drain (reason: stall_timeout); partial progress banked — re-run to resume.');
+      process.exit(1);
+    }
+    // A budget stop with work left is partial: verdict on stdout, and
+    // src/cli/commands/embed.ts exits with BUDGET_STOP_EXIT_CODE.
+    if (result.reason === 'time_budget') slog(embedBudgetStopVerdict(result));
     return result;
   } catch (e) {
-    if (progressStarted) progress.finish();
+    if (progressDone !== null) progress.finish();
+    const capped = costCap?.hit();
+    if (capped) {
+      const stopped: EmbedResult = { embedded: 0, skipped: 0, would_embed: 0, total_chunks: 0, pages_processed: 0, failures: 0, failure_samples: [], dryRun: false, chunkless_pages_healed: 0 };
+      noteEmbedCostStop(stopped, capped, args);
+      (args.includes('--json') ? serr : slog)(embedCostStopVerdict(stopped, capped));
+      return stopped;
+    }
+    if (args.includes('--json')) process.exit(writeCliError(e, 'embed', { json: true })); // D2: one v1 envelope on stdout
     // v0.41.6.0 D1: preflight throws EmbeddingCredentialError; surface the
     // paste-ready userMessage instead of the bare exception text.
     const { EmbeddingCredentialError } = await import('../core/embed-preflight.ts');
@@ -748,6 +1064,34 @@ export async function runEmbed(engine: BrainEngine, args: string[]): Promise<Emb
   }
 }
 
+/**
+ * Wave B: embed a segmented page's vector-less live rows (all of them with `all`)
+ * by keyset (`embedSegmentedPage`), never through its body or a whole-page
+ * chunk read. A dry run only counts those rows.
+ */
+async function embedSegmented(engine: BrainEngine, page: SegmentedEmbedPage, result: EmbedResult,
+  opts: { dryRun: boolean; signal?: AbortSignal; signature?: string; approvedCapUsd?: number; all?: boolean }): Promise<void> {
+  if (opts.dryRun) {
+    const counts = await countSegmentedEmbedRows(engine, page.id);
+    result.total_chunks += counts.total;
+    result.would_embed += opts.all ? counts.total : counts.stale;
+    result.pages_processed++;
+    return;
+  }
+  try {
+    const done = await embedSegmentedPage(engine, page, { embedFn: (texts, o) => embedBatchWithBackoff(texts, o),
+      signal: opts.signal, signature: opts.signature, approvedCapUsd: opts.approvedCapUsd, all: opts.all });
+    result.embedded += done.embedded;
+    const stamp = done.complete ? await resolveProvenanceStamp(engine, opts.signature) : undefined;
+    if (stamp) await stampIfPageProvenanceComplete(engine, page.slug, page.source_id, stamp);
+    if (done.stopped === 'page_moved') recordFailure(result, 1, page.slug, EMBED_UNAVAILABLE_MESSAGE);
+  } catch (e: unknown) {
+    if (isAborted(opts.signal)) throw e;
+    recordFailure(result, 1, page.slug, e);
+  }
+  result.pages_processed++;
+}
+
 async function embedPage(
   engine: BrainEngine,
   slug: string,
@@ -756,29 +1100,36 @@ async function embedPage(
   sourceId?: string,
   signal?: AbortSignal,
   quiet?: boolean,
+  approvedPageCapUsd?: number,
 ) {
   const opts = sourceId ? { sourceId } : undefined;
-  const page = await engine.getPage(slug, opts);
-  if (!page) {
+  const initial = await engine.readPageSnapshot(slug, opts);
+  if (!initial) {
     throw new Error(`Page not found: ${slug}`);
   }
+  const segmented = await readSealedSegmentedEmbedPage(engine, initial.page, !dryRun);
+  if (segmented) {
+    if (isEmbedSkipped(initial.page.frontmatter)) { if (!quiet) serr(`  ${slug}: skipped (frontmatter.embed_skip set); its chunks stay keyword-searchable`); return; }
+    await embedSegmented(engine, segmented, result, { dryRun, signal, signature: currentEmbeddingSignature() ?? undefined, approvedCapUsd: approvedPageCapUsd });
+    return;
+  }
+  const origin = await readProjectionSnapshot(engine, slug, initial.page.source_id, { allowUnsealed: true, requireLiveSource: !dryRun });
+  if (!origin || origin.snapshot.revision !== initial.revision || origin.snapshot.page.id !== initial.page.id
+    || origin.snapshot.sourceIncarnation !== initial.sourceIncarnation) {
+    if (!dryRun) recordFailure(result, 1, slug, EMBED_UNAVAILABLE_MESSAGE);
+    return;
+  }
+  const snapshot = origin.snapshot;
+  const page = snapshot.page;
+  if (isEmbedSkipped(page.frontmatter)) { if (!quiet) serr(`  ${slug}: skipped (frontmatter.embed_skip set); its chunks stay keyword-searchable`); return; }
 
   // Get existing chunks or create new ones.
   // In dryRun, we still chunk the text locally to count what WOULD be
   // embedded — but we never write chunks or call the embedding model.
-  let chunks = await engine.getChunks(slug, opts);
+  let chunks = page.text_projection_revision === snapshot.revision ? origin.chunks : [];
   if (chunks.length === 0) {
-    const inputs: ChunkInput[] = [];
-    if (page.compiled_truth.trim()) {
-      for (const c of chunkText(page.compiled_truth)) {
-        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
-      }
-    }
-    if (page.timeline.trim()) {
-      for (const c of chunkText(page.timeline)) {
-        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'timeline' });
-      }
-    }
+    // #4530: the active embedding model's per-input token limit; #5575 ENG-1: the page's fence overlay.
+    const inputs = await prepareProseChunks(page, origin.maxChunkTokens, origin.fenceOverlay);
 
     if (dryRun) {
       // Count what chunking WOULD produce, without writing.
@@ -789,9 +1140,30 @@ async function embedPage(
     }
 
     if (inputs.length > 0) {
-      await engine.upsertChunks(slug, inputs, opts);
-      chunks = await engine.getChunks(slug, opts);
+      let attempt = 0;
+      try {
+        // Another installer (the resident projection rebuild) may seal this revision first: re-read and use its chunks.
+        await retryProjectionConflict(async () => {
+          const prepared = attempt++ === 0 ? origin : await readProjectionSnapshot(engine, slug, page.source_id, { allowUnsealed: true, requireLiveSource: true });
+          if (!prepared || prepared.snapshot.revision !== snapshot.revision || prepared.snapshot.page.id !== page.id
+            || prepared.snapshot.sourceIncarnation !== snapshot.sourceIncarnation) throw new PageRevisionConflictError(snapshot.revision, prepared?.snapshot.revision ?? null);
+          if (prepared.snapshot.page.text_projection_revision !== snapshot.revision || !prepared.chunks.length) await installPageProjection(engine, prepared, inputs, { seal: true });
+        });
+      } catch (error) {
+        if (!(error instanceof PageRevisionConflictError)) throw error;
+        recordFailure(result, 1, slug, error instanceof PageProjectionConflictError ? error : EMBED_UNAVAILABLE_MESSAGE);
+        return;
+      }
+      chunks = await engine.getChunks(slug, { sourceId: page.source_id });
     }
+  } else if (!dryRun) {
+    // SUP-3874: legacy chunks may predate the model input-cap. Split them
+    // before the embed call so one oversized row can't fail the page/sweep.
+    const healed = await healOversizedPageChunks(engine, slug, {
+      sourceId: page.source_id,
+      onSplit: (n) => serr(`  ${slug}: split ${n} oversized chunk(s) to fit embedding input limit`),
+    });
+    if (healed.changed) chunks = healed.chunks;
   }
 
   // Embed chunks without embeddings. embedding_is_null is the stored-vector
@@ -799,7 +1171,7 @@ async function embedPage(
   // keying on embedded_at alone silently no-ops ("all chunks already
   // embedded") on a rebuild-darkened page. Older callers that selected chunks
   // without the boolean fall back to embedded_at.
-  const toEmbed = chunks.filter(c => !c.embedded_at || c.embedding_is_null === true);
+  let toEmbed = chunks.filter(c => !c.embedded_at || c.embedding_is_null === true);
   result.total_chunks += chunks.length;
   result.skipped += chunks.length - toEmbed.length;
 
@@ -826,19 +1198,29 @@ async function embedPage(
   // swallowed: the page stays NULL exactly as before, but the run now
   // reports it (result.failures → non-zero exit) instead of pretending
   // success. Abort (shutdown) still propagates.
+  const prepared = await readProjectionSnapshot(engine, slug, page.source_id, { requireLiveSource: true });
+  if (!prepared || prepared.snapshot.revision !== snapshot!.revision || prepared.chunks.some((chunk, i) => chunk.id !== chunks[i]?.id || chunk.chunk_text !== chunks[i]?.chunk_text)) {
+    recordFailure(result, toEmbed.length, slug, EMBED_UNAVAILABLE_MESSAGE);
+    return;
+  }
+  const metered = await meterPageBatch(engine, prepared.snapshot.page, toEmbed,
+    { signature: currentEmbeddingSignature(), announceHeld: true, ...(approvedPageCapUsd !== undefined && { approvedCapUsd: approvedPageCapUsd }) });
+  if (!metered) { result.pages_processed++; return; }
+  toEmbed = metered.chunks;
   let embeddings: (Float32Array | null)[];
   let failed = 0;
   let firstError: unknown;
   try {
-    ({ embeddings, failed, firstError } = await embedPageTexts(
-      wrapChunkTextsForStoredMode(page, toEmbed),
+    ({ embeddings, failed, firstError } = await spendGrant(metered.grant, () => embedPageTexts(
+      wrapChunkTextsForStoredMode(prepared.snapshot.page, toEmbed),
       signal ? { abortSignal: signal } : {},
-    ));
+    )));
   } catch (e: unknown) {
     if (isAborted(signal)) throw e;
     recordFailure(result, toEmbed.length, slug, e);
     result.pages_processed++;
     serr(`  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
+    await healAndReportOverLength(engine, slug, page.source_id, e, toEmbed.map(c => c.chunk_text), serr);
     return;
   }
   const embeddingMap = new Map<number, Float32Array>();
@@ -854,30 +1236,24 @@ async function embedPage(
     token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
   }));
 
-  await engine.upsertChunks(slug, updated, opts);
-  // v0.41.31: stamp provenance so a later model/dims swap is detectable as
-  // stale. embedPage is the per-slug path used by `gbrain embed <slug>` AND
-  // by `gbrain sync`'s post-import embed step (runEmbedCore({slugs})).
-  // Guard: only stamp when EVERY chunk was (re)embedded this pass. If some
-  // chunks were preserved from a prior embed (unknown/old provenance), the
-  // page is mixed — don't claim it's current. `embed --all` fully re-embeds
-  // such a page and then stamps it. #3037: a partial failure leaves failed
-  // chunks NULL, so don't stamp then either.
-  if (failed === 0 && toEmbed.length === chunks.length) {
-    // D9 honesty: no stamp when the gateway is unconfigured — a wrong
-    // signature is worse than none (NULL = unknown provenance).
-    const stampSig = currentEmbeddingSignature();
-    if (stampSig) {
-      await engine.setPageEmbeddingSignature(slug, { sourceId, signature: stampSig });
-    }
-    // #3507: a fully re-embedded per_chunk_synopsis page landed at the
-    // title tier — keep the stamped mode honest.
-    await restampIfDemotedToTitleTier(engine, page, slug, page.source_id);
+  const fullyEmbedded = failed === 0 && toEmbed.length === chunks.length;
+  // Vectors and their completion stamps share the page guard. A later
+  // contextual rebuild must not be relabeled by this attempt's restamp.
+  const install = await engine.transaction(async tx => {
+    const installed = await installPageEmbeddings(tx, prepared, updated,
+      fullyEmbedded ? currentEmbeddingSignature() ?? undefined : undefined);
+    if (fullyEmbedded && installed.complete) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, page.source_id);
+    return installed;
+  });
+  if (!install.complete && install.installed === 0) {
+    recordFailure(result, toEmbed.length, slug, EMBED_UNAVAILABLE_MESSAGE);
+    return;
   }
-  result.embedded += toEmbed.length - failed;
+  result.embedded += install.installed;
   if (failed > 0) {
     recordFailure(result, failed, slug, firstError);
     serr(`  ${slug}: ${failed} chunk(s) failed to embed; embedded the other ${toEmbed.length - failed}`);
+    await healAndReportOverLength(engine, slug, page.source_id, firstError, toEmbed.map(c => c.chunk_text), serr);
   }
   result.pages_processed++;
   if (!quiet) slog(`${slug}: embedded ${toEmbed.length - failed} chunks`);
@@ -925,6 +1301,7 @@ async function embedAll(
     quiet?: boolean;
     /** #3391: lift the NULL-signature grandfather clause (see EmbedOpts). */
     includeNullSignature?: boolean;
+    assertOwned?: (tx?: BrainEngine) => Promise<void>;
   },
   signal?: AbortSignal,
 ) {
@@ -984,10 +1361,7 @@ async function embedAll(
   // Paced runs lower this to the resolved cap (the real lever vs pooler-slot
   // starvation); unpaced keeps the env/default 20. Codex P2: only ever LOWER —
   // never raise above an operator's existing env cap.
-  const BASE_CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
-  const CONCURRENCY = staleOpts?.paceMaxConcurrency
-    ? Math.min(BASE_CONCURRENCY, staleOpts.paceMaxConcurrency)
-    : BASE_CONCURRENCY;
+  const CONCURRENCY = resolveEmbedConcurrency(engine.kind, staleOpts?.paceMaxConcurrency);
 
   async function embedOnePage(page: typeof pages[number]) {
     // #1737: bail before doing any work for this page if the run was aborted.
@@ -996,8 +1370,16 @@ async function embedAll(
     // target the correct (source_id, slug) row, not the 'default' source.
     const pageSourceId = page.source_id;
     const pageOpts = pageSourceId ? { sourceId: pageSourceId } : undefined;
-    const chunks = await observed(pacer, () => engine.getChunks(page.slug, pageOpts));
-    const toEmbed = chunks; // staleOnly path handled above via embedAllStale
+    const segmented = await observed(pacer, () => readSealedSegmentedEmbedPage(engine, page, !dryRun));
+    if (segmented) { await embedSegmented(engine, segmented, result, { dryRun, signal, signature, all: true }); return; }
+    const prepared = await observed(pacer, () => readProjectionSnapshot(engine, page.slug, pageSourceId, { requireLiveSource: !dryRun }));
+    if (!prepared) {
+      if (!dryRun) recordFailure(result, 1, page.slug, EMBED_UNAVAILABLE_MESSAGE);
+      return;
+    }
+    page = prepared.snapshot.page;
+    const chunks = prepared.chunks;
+    let toEmbed = chunks; // staleOnly path handled above via embedAllStale
 
     result.total_chunks += chunks.length;
     result.skipped += chunks.length - toEmbed.length;
@@ -1017,15 +1399,24 @@ async function embedAll(
       return;
     }
 
+    const metered = await meterPageBatch(engine, page, toEmbed, { signature, announceHeld: true });
+    if (!metered) {
+      processed++;
+      result.pages_processed++;
+      onProgress?.(processed, pages.length, result.embedded);
+      return;
+    }
+    toEmbed = metered.chunks;
+
     try {
       // #3507: reproduce the page's stored wrapping convention (see embedPage).
       // #3037: per-chunk failure isolation — one bad chunk costs one chunk,
       // not the whole page's siblings. The wrapped texts feed the fan-out
       // too, so an isolation retry never strips the contextual prefixes.
-      const { embeddings, failed, firstError } = await embedPageTexts(
+      const { embeddings, failed, firstError } = await spendGrant(metered.grant, () => embedPageTexts(
         wrapChunkTextsForStoredMode(page, toEmbed),
         signal ? { abortSignal: signal } : {},
-      );
+      ));
       // Build a map of new embeddings by chunk_index
       const embeddingMap = new Map<number, Float32Array>();
       for (let j = 0; j < toEmbed.length; j++) {
@@ -1042,36 +1433,30 @@ async function embedAll(
         embedding: embeddingMap.get(c.chunk_index) ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
-      await observed(pacer, () => engine.upsertChunks(page.slug, updated, pageOpts));
-      // v0.41.31: stamp embedding provenance so a later model swap is
-      // detectable as stale. #3037: not on partial failure — failed chunks
-      // stay NULL under unknown provenance. D9: no stamp without a gateway
-      // (signature undefined) — a wrong stamp is worse than none.
-      if (failed === 0) {
-        if (signature) {
-          await observed(pacer, () =>
-            engine.setPageEmbeddingSignature(page.slug, { sourceId: pageSourceId, signature }),
-          );
-        }
-        // #3507: --all fully re-embeds; a per_chunk_synopsis page landed at
-        // the title tier — keep the stamped mode honest. #3037: gated on
-        // failed === 0 — a partially-failed page was NOT fully re-embedded,
-        // so restamping would make contextual_retrieval_mode lie again
-        // (the exact #3461 bug).
-        await observed(pacer, () =>
-          restampIfDemotedToTitleTier(engine, page, page.slug, pageSourceId),
-        );
+      // Partial failures retain their old context; a full completion stamps
+      // its vectors and title-tier convention in the same guarded transaction.
+      const install = await observed(pacer, () => engine.transaction(async tx => {
+        const whole = failed === 0 && toEmbed.length === chunks.length;
+        const installed = await installPageEmbeddings(tx, prepared, updated, whole ? signature : undefined);
+        if (whole && installed.complete) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, page.slug, pageSourceId);
+        return installed;
+      }));
+      if (!install.complete && install.installed === 0) {
+        recordFailure(result, toEmbed.length, page.slug, EMBED_UNAVAILABLE_MESSAGE);
+        return;
       }
-      result.embedded += toEmbed.length - failed;
+      result.embedded += install.installed;
       if (failed > 0) {
         recordFailure(result, failed, page.slug, firstError);
         serr(`\n  ${page.slug}: ${failed} chunk(s) failed to embed; embedded the other ${toEmbed.length - failed}`);
+        await healAndReportOverLength(engine, page.slug, pageSourceId, firstError, toEmbed.map(c => c.chunk_text), serr);
       }
     } catch (e: unknown) {
       // #3037: count the darkened page so the run can't exit 0 (abort is a
       // shutdown, not a failure).
       if (!isAborted(signal)) recordFailure(result, toEmbed.length, page.slug, e);
       serr(`\n  Error embedding ${page.slug}: ${e instanceof Error ? e.message : e}`);
+      if (!isAborted(signal)) await healAndReportOverLength(engine, page.slug, pageSourceId, e, toEmbed.map(c => c.chunk_text), serr);
     }
 
     processed++;
@@ -1085,19 +1470,20 @@ async function embedAll(
     }
   }
 
-  // v0.41.15.0: sliding worker pool extracted into src/core/worker-pool.ts.
-  // Throughput characteristics unchanged from the prior inline pool — N
-  // workers atomically claim the next page; the helper is the canonical
-  // primitive. embedOnePage handles its own per-page errors via try/catch
-  // and stderr log (no rethrow), so we don't need failures[] here and
-  // omitting onError means the default 'continue' policy applies cleanly
-  // even though no errors should reach the pool's catch.
+  // Sliding worker pool (src/core/worker-pool.ts). #3037: embedOnePage reads the snapshot before its own
+  // try, so a failed read lands here as a page that never embedded; count it unless the run is aborting.
   await runSlidingPool({
     items: pages,
     workers: CONCURRENCY,
     ...(signal && { signal }), // #1737: pool stops claiming pages once aborted
     onItem: (page) => embedOnePage(page),
     failureLabel: (page) => page.slug,
+    onError: (e, page) => {
+      if (isAborted(signal)) return 'continue';
+      recordFailure(result, 1, page.slug, e);
+      serr(`\n  Error embedding ${page.slug}: ${e instanceof Error ? e.message : e}`);
+      return 'continue';
+    },
   });
 
   // Stdout summary preserved for scripts/tests that grep for counts.
@@ -1132,39 +1518,11 @@ async function embedAll(
  * contract (including `pages_processed`, which embedPage's own dry-run
  * branch increments for exactly this "examined, didn't write" case).
  *
- * Race note (review catch, three rounds — ACCEPTED RESIDUAL RISK, not
- * fully closed): between listing a page and writing its chunks, a
- * concurrent writer (sync, another `put_page`) could change or chunk the
- * SAME page. Two mitigations, both bounded — full atomicity (a
- * transaction/version-guarded conditional write inside `upsertChunks`)
- * would need a new engine primitive shared by every `upsertChunks` caller,
- * which is out of scope for a chunkless-page safety net:
- *   1. Immediately before writing, re-fetch the LIVE page via `getPage`
- *      and build `inputs` from ITS CURRENT content, not the batch-list
- *      snapshot — closes the "content changed but still chunkless"
- *      sub-case, not just the "chunks appeared" one.
- *   2. Re-check `getChunks` right after that same fetch — skip (don't
- *      overwrite) if chunks now exist AT THE TIME OF THE CHECK.
- * What this does NOT close: a writer that inserts chunks in the gap
- * BETWEEN step 2's check and the `upsertChunks` call immediately below it
- * (no intervening `await` other than that one call, but `upsertChunks`
- * itself is not conditioned on the check — this is still check-then-write,
- * not compare-and-swap) can still have its chunks overwritten — HONESTLY:
- * `upsertChunks` treats its input as the full desired chunk set for that
- * page and deletes any existing chunk_index absent from it, so a
- * concurrent writer's chunks landing in that exact gap CAN be replaced
- * with this sweep's stale-content chunks (embedding NULL). This is the
- * SAME check-then-write window `embedPage`'s existing single-page
- * chunkless branch already ships with today (that branch doesn't even
- * have step 2's re-check) — no new race CLASS is introduced, and the
- * window here is a single sequential getPage+getChunks+upsertChunks
- * instead of spanning a whole batch. The blast radius is bounded: the
- * page is NOT deleted or corrupted, just re-chunked from a stale
- * snapshot, and the NEXT write to that page (sync, another edit) that
- * actually chunks it restores correct content — this sweep's own
- * predicate is idempotent and doesn't compound the drift. Closing this
- * fully (true atomicity) is tracked as a follow-up, not blocking this
- * safety net.
+ * Capture the live canonical page, complete unsealed chunk set and indexing
+ * context under one short page guard, then chunk outside the transaction.
+ * Installation compares that originating snapshot under the same guard before
+ * changing any row. A newer canonical edit, completed projection or changed
+ * chunking context supersedes this attempt without counting it as healed.
  *
  * Per-page failure isolation (review catch): one malformed/oversized
  * chunkless page must not abort the sweep and, with it, the entire
@@ -1201,6 +1559,7 @@ async function healChunklessPages(
   pacer: DbPacer | undefined,
   startedAt: number,
   catchUp: boolean,
+  assertOwned?: (tx?: BrainEngine) => Promise<void>,
 ): Promise<void> {
   const BATCH_SIZE = 50;
   const BUDGET_MS: number | null = catchUp
@@ -1211,20 +1570,9 @@ async function healChunklessPages(
   let pagesHealed = 0;
   let budgetExceeded = false;
 
-  const buildInputs = (compiledTruth: string, timeline: string): ChunkInput[] => {
-    const inputs: ChunkInput[] = [];
-    if (compiledTruth.trim()) {
-      for (const c of chunkText(compiledTruth)) {
-        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
-      }
-    }
-    if (timeline.trim()) {
-      for (const c of chunkText(timeline)) {
-        inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'timeline' });
-      }
-    }
-    return inputs;
-  };
+  // #4530: the active embedding model's per-input token limit; #5575 ENG-1: the page's fence overlay.
+  const buildInputs = (page: { compiled_truth: string; timeline: string }, maxTokens = resolveMaxChunkTokens(), overlay?: FenceChunkOverlay) =>
+    prepareProseChunks(page, maxTokens, overlay);
   // BUDGET_MS === null means catch-up: no wall-clock cap on this sweep,
   // mirroring the main stale loop's own --catch-up handling below.
   const overBudget = (): boolean => BUDGET_MS != null && Date.now() - startedAt > BUDGET_MS;
@@ -1250,7 +1598,7 @@ async function healChunklessPages(
           // dryRun never writes, so there's no live-refetch race to close —
           // chunk the listed snapshot directly (matches embedPage's own
           // dry-run, which chunks whatever getPage returned at call time).
-          const inputs = buildInputs(page.compiled_truth, page.timeline);
+          const inputs = await buildInputs(page);
           // Whitespace-only content (SQL prefilter is `<> ''`, not
           // trim-aware) chunks to nothing — matches embedPage's contract.
           if (inputs.length === 0) continue;
@@ -1261,21 +1609,15 @@ async function healChunklessPages(
           continue;
         }
 
-        // Re-fetch the LIVE page + re-check chunks immediately before
-        // writing (see race note above): chunk CURRENT content, and skip
-        // rather than clobber if a concurrent writer already chunked this
-        // page since we listed it.
-        const [livePage, stillChunkless] = await Promise.all([
-          observed(activePacer, () => engine.getPage(page.slug, { sourceId: page.source_id })),
-          observed(activePacer, () => engine.getChunks(page.slug, { sourceId: page.source_id })),
-        ]);
-        if (!livePage || stillChunkless.length > 0) continue;
-        const inputs = buildInputs(livePage.compiled_truth, livePage.timeline);
+        const prepared = await observed(activePacer, () => readProjectionSnapshot(engine, page.slug, page.source_id, { allowUnsealed: true, requireLiveSource: true }));
+        if (!prepared || prepared.chunks.length > 0) continue;
+        const inputs = await buildInputs(prepared.snapshot.page, prepared.maxChunkTokens, prepared.fenceOverlay);
         if (inputs.length === 0) continue;
 
-        await observed(activePacer, () =>
-          engine.upsertChunks(page.slug, inputs, { sourceId: page.source_id }),
-        );
+        await observed(activePacer, () => engine.transaction(async tx => {
+          await assertOwned?.(tx);
+          await installPageProjection(tx, prepared, inputs, { seal: true });
+        }));
         pagesHealed++;
         try {
           await activePacer.pace(signal);
@@ -1283,6 +1625,7 @@ async function healChunklessPages(
           if (!(e instanceof AbortError)) throw e;
         }
       } catch (e) {
+        if (e instanceof PageRevisionConflictError) continue;
         if (isAborted(signal)) break;
         recordFailure(result, 1, page.slug, e);
         serr(`\n  [embed] chunkless-page heal failed for ${page.slug}: ${e instanceof Error ? e.message : e}`);
@@ -1341,6 +1684,7 @@ async function embedAllStale(
     quiet?: boolean;
     /** #3391: lift the NULL-signature grandfather clause (see EmbedOpts). */
     includeNullSignature?: boolean;
+    assertOwned?: (tx?: BrainEngine) => Promise<void>;
   },
   signature?: string,
   externalSignal?: AbortSignal,
@@ -1351,11 +1695,43 @@ async function embedAllStale(
   // ONE `GBRAIN_EMBED_TIME_BUDGET_MS` window instead of summing two
   // independent 30-minute budgets.
   const overallStartedAt = Date.now();
+  const BUDGET_MS: number | null = staleOpts?.catchUp
+    ? null
+    : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
 
   // D7: thread sourceId so source-scoped runs only count + visit
   // that source's NULL embeddings.
   const sourceOpt = sourceId ? { sourceId } : undefined;
+  if (isAborted(externalSignal)) return;
   const includeNullSig = !!staleOpts?.includeNullSignature;
+  const noteBudgetStop = () => noteEmbedBudgetStop(engine, result, { sourceId, signature, includeNullSignature: includeNullSig, skip: dryRun || BUDGET_MS === null || isAborted(externalSignal) });
+  let reportedArchived = 0;
+  const reportArchived = async () => {
+    if (dryRun) return;
+    const blocked = await countArchivedEmbeddingWork(engine, { sourceId, signature, includeNullSignature: includeNullSig });
+    if (blocked <= reportedArchived) return;
+    result.failures += blocked - reportedArchived;
+    reportedArchived = blocked;
+    result.failure_samples.push(`${blocked} archived page(s) have blocked embedding work; active pages can progress, but this run is incomplete. Use gbrain sources restore <id> deliberately before retrying archived work.`);
+  };
+  await reportArchived();
+  const readinessOptions = { sourceId, existingChunksOnly: true, activeSourcesOnly: true, stale: { signature, includeNullSignature: includeNullSig }, signal: externalSignal,
+    deadline: BUDGET_MS === null ? undefined : overallStartedAt + BUDGET_MS };
+  let readiness = await prepareEmbeddingProjections(engine, readinessOptions);
+  if (isAborted(externalSignal) || Date.now() >= (readinessOptions.deadline ?? Infinity)) return await noteBudgetStop();
+  if (readiness.blocked && !dryRun) {
+    const probeOk = await probeEmbedder((texts, fnOpts) => embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }), signature ?? undefined, externalSignal);
+    if (isAborted(externalSignal) || Date.now() >= (readinessOptions.deadline ?? Infinity)) return await noteBudgetStop();
+    if (!probeOk) {
+      result.failures += readiness.blocked;
+      result.failure_samples.push('Projection recovery requires a working embedding provider; existing projections were preserved.');
+      return;
+    }
+    readiness = await prepareEmbeddingProjections(engine, { ...readinessOptions, repair: true, assertOwned: staleOpts?.assertOwned });
+    if (isAborted(externalSignal) || Date.now() >= (readinessOptions.deadline ?? Infinity)) return await noteBudgetStop();
+  }
+  // #6223: pages still blocked after bounded recovery never stop the run; the guarded drain counts them.
+  const blockedProjections = readiness.blocked && !dryRun ? await reportBlockedProjections(engine, readinessOptions, readiness.blocked, result.failure_samples) : new Set<string>();
 
   // Chunkless-page safety net: pre-flight count mirrors the countStaleChunks
   // short-circuit just below — a healthy brain pays one extra SELECT
@@ -1367,7 +1743,7 @@ async function embedAllStale(
   if (chunklessCount > 0) {
     await healChunklessPages(
       engine, sourceId, dryRun, result, staleOpts?.quiet, externalSignal, staleOpts?.pacer,
-      overallStartedAt, !!staleOpts?.catchUp,
+      overallStartedAt, !!staleOpts?.catchUp, staleOpts?.assertOwned,
     );
   }
   // Review catch: an abort during healing must stop the run HERE, before
@@ -1381,12 +1757,52 @@ async function embedAllStale(
   // swap). dry-run must NOT mutate, so it counts signature-stale via the
   // widened predicate; a live run NULLs them first so the existing
   // NULL-embedding cursor (listStaleChunks) picks them up unchanged.
+  // Guarded (#4306): embed_skip pages keep their retained vectors — every
+  // stale selector excludes them, so NULLing them here (the migrate
+  // embeddings drain path included) would be permanent loss.
+  //
+  // #4283: NULLing is conditional on a WORKING embedder. The drift pre-count
+  // keeps the probe's one embed call off the no-drift common path; a failed
+  // probe (bad key, unreachable provider, wrong-dims model) skips the
+  // invalidation so a misresolved config can't strip vectors it can never
+  // replace. validateEmbeddingCreds at runEmbedCore entry is a static env
+  // check only — the probe is the live proof.
   if (!dryRun && signature) {
-    const invalidated = await engine.invalidateStaleSignatureEmbeddings({
-      signature,
-      ...(sourceId && { sourceId }),
-      ...(includeNullSig && { includeNullSignature: true }),
-    });
+    let signatureDrift = 0;
+    try {
+      const sources = await engine.executeRaw<{ id: string }>('SELECT id FROM sources WHERE NOT archived AND ($1::text IS NULL OR id=$1) ORDER BY id', [sourceId ?? null]);
+      for (const source of sources) {
+        const wide = await engine.countStaleChunks({ sourceId: source.id, signature, ...(includeNullSig && { includeNullSignature: true }) });
+        const nullOnly = await engine.countStaleChunks({ sourceId: source.id });
+        signatureDrift += wide - nullOnly;
+      }
+    } catch {
+      // Pre-count is best-effort; fall through as "no drift" (no NULLing).
+    }
+    let invalidated = 0;
+    if (signatureDrift > 0) {
+      const probeOk = await probeEmbedder(
+        (texts, fnOpts) => embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }),
+        signature,
+        externalSignal,
+      );
+      if (probeOk) {
+        invalidated = await engine.transaction(async tx => {
+          await staleOpts?.assertOwned?.(tx);
+          return invalidateStaleSignatureEmbeddingsGuarded(tx, {
+            signature,
+            ...(sourceId && { sourceId }),
+            ...(includeNullSig && { includeNullSignature: true }),
+          });
+        });
+      } else {
+        serr(
+          `  [embed] WARNING: ${signatureDrift} chunk(s) drifted from signature ${signature} but the ` +
+          `embedder probe failed — SKIPPING invalidation (existing vectors preserved). ` +
+          `Check embedding provider config/credentials.`,
+        );
+      }
+    }
     if (invalidated > 0 && !staleOpts?.quiet) {
       slog(`[embed] invalidated ${invalidated} chunk(s) embedded under a prior model signature`);
     }
@@ -1404,7 +1820,11 @@ async function embedAllStale(
       try {
         const wide = await engine.countStaleChunks({ ...sourceOpt, signature, includeNullSignature: true });
         const narrow = await engine.countStaleChunks({ ...sourceOpt, signature });
-        const leftBehind = wide - narrow;
+        // #5527: a NULL-signature page whose vectors already match the current
+        // model, width and text is only missing its stamp, not in another space.
+        const currentSpace = await countRestampOnlyChunks(engine, { signature, sourceId, includeNullSignature: true })
+          - await countRestampOnlyChunks(engine, { signature, sourceId });
+        const leftBehind = wide - narrow - currentSpace;
         if (leftBehind > 0) {
           serr(
             `  [embed] WARNING: ${leftBehind} embedded chunk(s) sit on pages with no recorded ` +
@@ -1419,6 +1839,26 @@ async function embedAllStale(
     }
   }
 
+  // #4246: invalidate chunks whose embedding was computed from a PREVIOUS
+  // chunk_text revision (embedded_text_hash <> md5(chunk_text)) so content
+  // edits flow through the NULL cursor. NOT probe-gated: the blast radius is
+  // bounded by real content edits (config-independent, unlike signature
+  // drift) and those vectors point at stale text either way. NULL hash
+  // (pre-v133 rows) is grandfathered.
+  if (!dryRun) {
+    try {
+      const drifted = staleOpts?.assertOwned ? await engine.transaction(async tx => {
+        await staleOpts?.assertOwned?.(tx);
+        return tx.invalidateContentDriftEmbeddings(sourceId ? { sourceId } : undefined);
+      }) : await engine.invalidateContentDriftEmbeddings(sourceId ? { sourceId } : undefined);
+      if (drifted > 0 && !staleOpts?.quiet) {
+        slog(`[embed] invalidated ${drifted} chunk(s) whose text changed after embedding (content drift)`);
+      }
+    } catch {
+      // Best-effort (pre-v133 schema mid-upgrade); the NULL-only loop still runs.
+    }
+  }
+
   // Pre-flight: 0 stale chunks → nothing to do, no further DB reads.
   // dry-run includes signature-drift in the count without mutating.
   const staleCount = await engine.countStaleChunks(
@@ -1426,7 +1866,9 @@ async function embedAllStale(
       ? { ...sourceOpt, signature, ...(includeNullSig && { includeNullSignature: true }) }
       : sourceOpt,
   );
+  const staleProgress = new StaleChunkProgress(staleCount);
   if (staleCount === 0) {
+    await reportArchived();
     if (!staleOpts?.quiet) {
       if (dryRun) {
         // dryRun never writes, so a healed-but-hypothetical chunkless page's
@@ -1446,7 +1888,10 @@ async function embedAllStale(
   }
 
   if (dryRun) {
-    result.would_embed += staleCount;
+    // #5289: current-space vectors on a drifted page are restamped, not re-embedded.
+    const restamp = signature ? await countRestampOnlyChunks(engine, { signature, sourceId, includeNullSignature: includeNullSig }) : 0;
+    result.would_embed += staleCount - restamp;
+    result.would_restamp = restamp;
     result.total_chunks += staleCount;
     // No progress event: a dry run reads a count and processes zero pages, so
     // there is no page total to report. The previous synthetic onProgress(1,1,0)
@@ -1461,7 +1906,7 @@ async function embedAllStale(
       const chunklessNote = result.chunkless_pages_healed > 0
         ? `, including ${result.chunkless_pages_healed} chunkless page(s)`
         : '';
-      slog(`[dry-run] Would embed ${result.would_embed} stale chunks${chunklessNote}`);
+      slog(`[dry-run] Would embed ${result.would_embed} stale chunks${chunklessNote}${restamp ? `; ${restamp} chunk(s) keep their vectors and are only restamped` : ''}`);
     }
     return;
   }
@@ -1475,10 +1920,7 @@ async function embedAllStale(
   // Paced runs lower concurrency to the resolved cap (E-1: worker count IS the
   // lever on this single pool, no separate permit). Codex P2: pacing only ever
   // LOWERS concurrency — never raise above an operator's existing env cap.
-  const BASE_CONCURRENCY = parseInt(process.env.GBRAIN_EMBED_CONCURRENCY || '20', 10);
-  const CONCURRENCY = staleOpts?.paceMaxConcurrency
-    ? Math.min(BASE_CONCURRENCY, staleOpts.paceMaxConcurrency)
-    : BASE_CONCURRENCY;
+  const CONCURRENCY = resolveEmbedConcurrency(engine.kind, staleOpts?.paceMaxConcurrency);
   const pacer = staleOpts?.pacer ?? createNoopPacer();
 
   // D3 + D3a + D8: wall-clock budget. 30 min default; env override.
@@ -1489,9 +1931,6 @@ async function embedAllStale(
   // to NOT arm the timer in catch-up at all: the keyset pass below terminates on
   // its own (the (page_id, chunk_index) cursor advances monotonically), and
   // SIGINT / worker-abort still propagate via externalSignal.
-  const BUDGET_MS: number | null = staleOpts?.catchUp
-    ? null
-    : parseInt(process.env.GBRAIN_EMBED_TIME_BUDGET_MS || `${30 * 60 * 1000}`, 10);
   const budgetController = new AbortController();
   // Shares overallStartedAt with the chunkless-page healing sweep above
   // (review catch) so the two phases draw from ONE combined budget window
@@ -1528,7 +1967,8 @@ async function embedAllStale(
     ? 'updated_desc'
     : 'page_id';
 
-  let totalProcessedPages = 0;
+  const processedPageKeys = new Set<string>(); // #5226: a page spanning listing batches counts once
+  const unavailablePages = new Map<string, string>(); // #5804: key -> slug, summarized once after the drain
   let afterPageId = 0;
   let afterChunkIndex = -1;
   let afterUpdatedAt: string | null = null;
@@ -1556,7 +1996,7 @@ async function embedAllStale(
     if (remaining === 0) return false;
     if (result.embedded === lastReentryEmbedded) return false; // no forward progress
     lastReentryEmbedded = result.embedded;
-    reentries++;
+    reentries++; staleProgress.reentered(remaining);
     afterPageId = 0;
     afterChunkIndex = -1;
     afterUpdatedAt = null;
@@ -1564,6 +2004,7 @@ async function embedAllStale(
     return true;
   };
 
+  const stamp = await resolveProvenanceStamp(engine, signature); // column resolved once per drain, not per page
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -1594,7 +2035,7 @@ async function embedAllStale(
         if (await maybeReenter()) continue;
         break;
       }
-      totalChunksLoaded += batch.length;
+      totalChunksLoaded += batch.length; staleProgress.listed(batch.length);
 
       // Advance cursor to last row in this batch.
       const last = batch[batch.length - 1];
@@ -1618,29 +2059,73 @@ async function embedAllStale(
         else byKey.set(key, [row]);
       }
 
-      const keys = Array.from(byKey.keys());
+      // #3622: keep quarantined pages out of the pool. The keyset cursor
+      // still advances past their rows, so a fully-quarantined batch can
+      // never spin the loop.
+      const QUARANTINE_AFTER = embedQuarantineThreshold();
+      const allKeys = Array.from(byKey.keys());
+      const keys = allKeys.filter(k => (_embedFailureCounts.get(k) ?? 0) < QUARANTINE_AFTER);
+      if (keys.length < allKeys.length) {
+        serr(`\n  [embed] skipping ${allKeys.length - keys.length} page(s) quarantined after ${QUARANTINE_AFTER} consecutive failed embed attempts (this process); set frontmatter.embed_skip to skip permanently, or restart to retry`);
+        for (const k of allKeys) if (!keys.includes(k)) staleProgress.pageDone(byKey.get(k)!.length, 0);
+      }
       result.total_chunks += batch.length;
 
       async function embedOneKey(key: string) {
-        const stale = byKey.get(key)!;
+        let stale = byKey.get(key)!;
+        const census = stale.length;
         const keySourceId = stale[0]?.source_id ?? 'default';
         const slug = stale[0].slug;
         try {
+          const segmented = await observed(pacer, () => readSegmentedEmbedPage(engine, { sourceId: keySourceId, slug }));
+          if (segmented) { await embedSegmented(engine, segmented, result, { dryRun: false, signal: effectiveSignal, signature }); processedPageKeys.add(key); return; }
+          // SUP-3874: split legacy oversized chunk_text BEFORE the embed call.
+          // `--stale` reuses stored rows; without this, one pre-cap chunk
+          // (e.g. a long pre-cap notes page on a 512-token model) fails
+          // forever and exits the sweep non-zero.
+          const healed = await observed(pacer, () => engine.transaction(async tx => {
+            await staleOpts?.assertOwned?.(tx);
+            return healOversizedPageChunks(tx, slug, {
+              sourceId: keySourceId,
+              onSplit: (n) => {
+                result.healed_splits = (result.healed_splits ?? 0) + n;
+                serr(`\n  ${slug}: split ${n} oversized chunk(s) to fit embedding input limit`);
+              },
+            });
+          }));
+          if (healed.changed) {
+            stale = healedChunksToStaleRows(healed.chunks, slug, keySourceId);
+            if (stale.length === 0) {
+              processedPageKeys.add(key);
+              result.pages_processed++;
+              return;
+            }
+          }
+
           // #3507: fetch the page row for its title + stored CR mode so the
           // re-embed reproduces the page's wrapping convention instead of
           // silently stripping contextual prefixes — `embed --stale` is the
           // NORMAL post-model-migration path, so raw-text embedding here
           // quietly converted whole corpora to the unwrapped convention.
-          const pageRow = await observed(pacer, () => engine.getPage(slug, { sourceId: keySourceId }));
-          // #3037: per-chunk failure isolation — one bad chunk costs one
-          // chunk, not the whole page's siblings. The wrapped texts feed the
-          // fan-out too, so an isolation retry never strips the prefixes.
-          const { embeddings, failed, firstError } = await embedPageTexts(
-            wrapChunkTextsForStoredMode(pageRow, stale),
-            { abortSignal: effectiveSignal },
-          );
-          // Re-fetch existing chunks and merge to avoid deleting non-stale chunks.
-          const existing = await observed(pacer, () => engine.getChunks(slug, { sourceId: keySourceId }));
+          const prepared = await observed(pacer, () => readProjectionSnapshot(engine, slug, keySourceId, { requireLiveSource: true }));
+          if (!prepared) {
+            // #5804: a page edited, deleted or unsealed mid-run is a counted failure, not a silent
+            // skip. An archived source is left to reportArchived, which already counts its pages.
+            const [source] = await observed(pacer, () => engine.executeRaw<{ archived: boolean }>('SELECT archived FROM sources WHERE id = $1', [keySourceId]));
+            if (!source?.archived) { result.failures += stale.length; if (!blockedProjections.has(key)) unavailablePages.set(key, slug); }
+            return;
+          }
+          const selected = new Map(stale.map(c => [c.chunk_index, c]));
+          const existing = prepared.chunks;
+          stale = existing.filter(c => selected.get(c.chunk_index)?.chunk_text === c.chunk_text)
+            .map(c => ({ ...selected.get(c.chunk_index)!, ...c }));
+          if (!stale.length) return;
+          const pageRow = prepared.snapshot.page;
+          const metered = await meterPageBatch(engine, pageRow, existing.filter(c => !c.embedded_at), { signature, announceHeld: true });
+          if (!metered) return;
+          if (metered.grant) stale = metered.chunks.map(c => ({ ...(selected.get(c.chunk_index) ?? { source_id: keySourceId, slug, page_id: pageRow.id }), ...c }));
+          const { embeddings, failed, firstError } = await spendGrant(metered.grant, () => embedPageTexts(
+            wrapChunkTextsForStoredMode(pageRow, stale), { abortSignal: effectiveSignal }));
           const staleIdxToEmbedding = new Map<number, Float32Array>();
           for (let j = 0; j < stale.length; j++) {
             const emb = embeddings[j];
@@ -1656,46 +2141,38 @@ async function embedAllStale(
             embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
             token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
           }));
-          await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
-          // v0.41.31: stamp provenance after the page's chunks are embedded —
-          // but only when EVERY chunk was stale (fully re-embedded this pass).
-          // A partially-stale page keeps preserved chunks of unknown/old
-          // provenance, so don't claim it's current. (After invalidate, a
-          // signature-drifted page IS fully stale → this stamps it.)
-          // #3037: not on partial failure — failed chunks stay NULL.
-          if (signature && failed === 0 && stale.length === existing.length) {
-            await observed(pacer, () =>
-              engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
-            );
-          }
-          // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
-          // title tier — keep the stamped mode honest. Partially-stale pages
-          // stay stamped as-is (mixed provenance; reindex sweeps fix them).
-          // #3037: `failed === 0` is part of "fully re-embedded" — if the
-          // per-chunk isolation left some chunks NULL, restamping would make
-          // contextual_retrieval_mode lie again (the exact #3461 bug).
-          if (failed === 0 && stale.length === existing.length) {
-            await observed(pacer, () =>
-              restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId),
-            );
-          }
-          result.embedded += stale.length - failed;
+          // The last batch stamps from complete DB provenance (#4825).
+          // Keep both stamps with vector installation so later contextual
+          // work cannot commit between installation and title-tier demotion.
+          const install = await observed(pacer, () => engine.transaction(async tx => {
+            await staleOpts?.assertOwned?.(tx);
+            const installed = await installPageEmbeddings(tx, prepared, merged);
+            if (stamp && failed === 0) await stampIfPageProvenanceComplete(tx, slug, keySourceId, stamp);
+            if (failed === 0 && stale.length === existing.length && installed.complete) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, keySourceId);
+            return installed;
+          }));
+          if (!install.complete && install.installed === 0) return;
+          result.embedded += install.installed;
           if (failed > 0) {
             recordFailure(result, failed, slug, firstError);
             serr(`\n  ${slug}: ${failed} chunk(s) failed to embed; embedded the other ${stale.length - failed}`);
+            await healAndReportOverLength(engine, slug, keySourceId, firstError, stale.map(c => c.chunk_text), serr);
           }
+          // #3622: reaching here means at least one chunk persisted (a total
+          // embed failure throws) — progress, so the quarantine counter resets.
+          _embedFailureCounts.delete(key);
         } catch (e: unknown) {
           // Budget/abort-fired cancellations are expected on the way out; don't
           // spam per-page "Error embedding" lines when we're shutting down.
           if (effectiveSignal.aborted) return;
           recordFailure(result, stale.length, slug, e);
           serr(`\n  Error embedding ${slug}: ${e instanceof Error ? e.message : e}`);
+          noteEmbedQuarantineFailure(key, slug); await healAndReportOverLength(engine, slug, keySourceId, e, stale.map(c => c.chunk_text), serr);
+        } finally {
+          const tally = staleProgress.pageDone(census, stale.length); onProgress?.(tally.done, tally.total, result.embedded);
         }
-        totalProcessedPages++;
+        processedPageKeys.add(key);
         result.pages_processed++;
-        // Use staleCount as the estimated total for progress (not exact after
-        // pagination starts, but directionally correct).
-        onProgress?.(totalProcessedPages, Math.ceil(staleCount / PAGE_SIZE) * keys.length, result.embedded);
         // Cooperative DB-contention pace between keys (no-op when unpaced).
         // E-4 (Codex P1): pace() is subject to the EXTERNAL abort only, NOT the
         // wall-clock budget — a contended DB's sleep must not be cut by the
@@ -1733,9 +2210,16 @@ async function embedAllStale(
     }
   } finally {
     if (budgetTimer) clearTimeout(budgetTimer);
+    await reportArchived();
+    if (unavailablePages.size > 0) {
+      const slugs = [...unavailablePages.values()];
+      const more = slugs.length > 5 ? ` and ${slugs.length - 5} more` : '';
+      result.failure_samples.push(`${slugs.length} page(s) not embedded: the page changed, was deleted or lost its projection during this run, so no embeddings were installed (${slugs.slice(0, 5).join(', ')}${more}). Their stale chunks are kept; rerun gbrain embed --stale, and inspect any page that keeps failing with gbrain get <slug>.`);
+    }
   }
 
-  if (!staleOpts?.quiet) slog(`Embedded ${result.embedded} chunks across ${totalProcessedPages} pages`);
+  if (budgetSignal.aborted) await noteBudgetStop();
+  if (!staleOpts?.quiet) slog(`Embedded ${result.embedded} chunks across ${processedPageKeys.size} pages`);
 
   // #1946 (OV2a): a catch-up pass that completed without being aborted but left
   // chunks unembedded means those chunks are stuck (a non-transient embed
@@ -1751,155 +2235,6 @@ async function embedAllStale(
       serr(`\n  [embed] catch-up finished but ${remaining} chunk(s) remain stale after ${result.failures} embed failure(s). These are not embeddable as-is; re-running won't clear them until the underlying error is resolved.`);
     }
   }
-}
-
-/**
- * v0.33.3: rate-limit-aware embedBatch wrapper.
- *
- * The OpenAI SDK has built-in retry with exponential backoff, but its
- * backoff window (max ~4s) is too short for TPM (tokens-per-minute)
- * rate limits on large pages (~90K tokens).  This wrapper catches
- * 429-shaped errors, parses the retry delay from the error message
- * (e.g. "Please try again in 248ms"), and sleeps before retrying.
- *
- * v0.33.4 hardening (codex + re-review findings):
- *   - D4: detect 429 via the wrapped error's `cause.status` (the gateway's
- *     normalizeAIError stores the original error there). Bare `e.status`
- *     never fires against an `AITransientError` wrap. Message-match stays
- *     as a fallback.
- *   - D4a: pass `maxRetries: 0` through `embedBatch` so the AI SDK's
- *     default 2-retry stack doesn't multiply this wrapper's 5 attempts.
- *   - D2: jitter the parsed delay ±30% so 20 concurrent workers don't
- *     resynchronize on the next 429 wave.
- *   - D3a/D8: when an external AbortSignal fires (wall-clock budget), the
- *     sleep wakes up early AND the abortSignal is threaded into the gateway
- *     embed call so an in-flight HTTP request cancels too.
- *
- * Up to MAX_RATE_LIMIT_RETRIES attempts with the parsed (jittered) delay
- * (or a 60s fallback when the message can't be parsed).
- *
- * @internal Exported for unit tests; not part of the public surface.
- */
-export const MAX_RATE_LIMIT_RETRIES = 5;
-export const RATE_LIMIT_FALLBACK_MS = 60_000;
-export const RATE_LIMIT_PAD_MS = 500;
-export const RATE_LIMIT_JITTER = 0.3;
-
-export interface EmbedBatchWithBackoffOpts {
-  abortSignal?: AbortSignal;
-}
-
-/**
- * Walk the cause chain looking for a 429 status. The current
- * `normalizeAIError` wraps once into `AITransientError` with `cause = original`,
- * so one level is sufficient — but iterate to handle future wrap layers
- * defensively (max 5 levels to bound a malformed cyclic chain).
- *
- * @internal exported for unit tests.
- */
-export function detect429FromCause(e: unknown): boolean {
-  let cur: unknown = e;
-  for (let depth = 0; depth < 5 && cur !== undefined && cur !== null; depth++) {
-    const obj = cur as { status?: unknown; statusCode?: unknown; cause?: unknown };
-    if (obj.status === 429 || obj.statusCode === 429) return true;
-    cur = obj.cause;
-  }
-  return false;
-}
-
-/**
- * Parse a Retry-After hint out of an OpenAI-style 429 message. Falls back
- * to `RATE_LIMIT_FALLBACK_MS` when the message can't be parsed. Adds
- * `RATE_LIMIT_PAD_MS` padding and `RATE_LIMIT_JITTER` randomization so
- * concurrent workers don't resynchronize.
- *
- * @internal exported for unit tests.
- */
-export function parseRetryDelayMs(msg: string, rng: () => number = Math.random): number {
-  let delayMs = RATE_LIMIT_FALLBACK_MS;
-  const msMatch = msg.match(/try again in (\d+)ms/i);
-  const secMatch = msg.match(/try again in ([\d.]+)s/i);
-  if (msMatch) delayMs = parseInt(msMatch[1], 10) + RATE_LIMIT_PAD_MS;
-  else if (secMatch) delayMs = Math.ceil(parseFloat(secMatch[1]) * 1000) + RATE_LIMIT_PAD_MS;
-  // D2: ±30% jitter to decorrelate the herd of 20 workers.
-  const jitterFactor = 1 + (rng() * 2 - 1) * RATE_LIMIT_JITTER;
-  return Math.max(1, Math.floor(delayMs * jitterFactor));
-}
-
-/**
- * Sleep for `ms` milliseconds. Resolves early (not rejects) when `signal`
- * fires, so the retry loop's caller can re-check `signal.aborted` and
- * exit cleanly without an unhandled rejection.
- *
- * @internal exported for unit tests.
- */
-export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal?.aborted) {
-      resolve();
-      return;
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-export async function embedBatchWithBackoff(
-  texts: string[],
-  opts: EmbedBatchWithBackoffOpts = {},
-): Promise<Float32Array[]> {
-  const signal = opts.abortSignal;
-  for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt++) {
-    if (signal?.aborted) throw new Error('embed budget aborted');
-    try {
-      // D4a + D8: maxRetries:0 disables the SDK's stacked retries (so this
-      // wrapper is the single source of truth) and abortSignal threads
-      // through to the gateway so an in-flight HTTP request cancels mid-fetch.
-      return await embedBatch(texts, { maxRetries: 0, ...(signal && { abortSignal: signal }) });
-    } catch (e: unknown) {
-      // If the budget fired we may have been aborted mid-fetch; bubble out.
-      if (signal?.aborted) throw e;
-      const msg = e instanceof Error ? e.message : String(e);
-      if (!isRateLimitError(e) || attempt === MAX_RATE_LIMIT_RETRIES) throw e;
-
-      const delayMs = parseRetryDelayMs(msg);
-      serr(`  [rate-limit] attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}, waiting ${delayMs}ms...`);
-      await abortableSleep(delayMs, signal);
-    }
-  }
-  // Unreachable, but TypeScript needs it.
-  return embedBatch(texts);
-}
-
-/**
- * 429 judgment shared by embedBatchWithBackoff (retry decision) and
- * embedPageTexts (fan-out decision). D4: structured detection first
- * (gateway-wrapped errors via cause chain); message-match as fallback for
- * providers whose wrappers strip `cause.status`.
- */
-function isRateLimitError(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e);
-  return detect429FromCause(e) || /rate.?limit|429/i.test(msg);
-}
-
-/** Walk the cause chain (like detect429FromCause) for the first HTTP status. */
-function statusFromCause(e: unknown): number | undefined {
-  let cur: unknown = e;
-  for (let depth = 0; depth < 5 && cur !== undefined && cur !== null; depth++) {
-    const obj = cur as { status?: unknown; statusCode?: unknown; cause?: unknown };
-    if (typeof obj.status === 'number') return obj.status;
-    if (typeof obj.statusCode === 'number') return obj.statusCode;
-    cur = obj.cause;
-  }
-  return undefined;
 }
 
 /**
@@ -1934,11 +2269,16 @@ async function embedPageTexts(
   opts: EmbedBatchWithBackoffOpts = {},
 ): Promise<{ embeddings: (Float32Array | null)[]; failed: number; firstError?: unknown }> {
   try {
-    return { embeddings: await embedBatchWithBackoff(texts, opts), failed: 0 };
+    // #4616: the gateway already isolated degenerate items; keep the rest.
+    const { vectors, refused } = await embedBatchKeepingUsable(texts, opts);
+    return { embeddings: vectors, failed: refused?.failures.length ?? 0, firstError: refused };
   } catch (e: unknown) {
     if (opts.abortSignal?.aborted) throw e; // shutdown, not a chunk problem
+    if (isEmbeddingZeroNormError(e)) throw e; // nothing usable: fanning out would re-send the same inputs
     if (texts.length <= 1) throw e; // nothing to isolate
-    if (isRateLimitError(e) || e instanceof AITransientError) throw e;
+    // #3374 — network-transient exhaustion isn't chunk-specific either:
+    // fanning out during an outage multiplies failing calls per page.
+    if (!isSingleInputOverLengthError(e) && (isEmbedRetriableError(e) || isTransientNetworkEmbedError(e) || e instanceof AITransientError)) throw e;
     const status = statusFromCause(e);
     if (status === 401 || status === 403) throw e;
 

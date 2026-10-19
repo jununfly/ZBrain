@@ -32,8 +32,9 @@ Override priority (highest first):
 1. CLI flag (`--model opus`)
 2. Per-task config (`gbrain config set models.dream.synthesize opus`)
 3. Deprecated per-task config (stderr-warns once, then honored)
-4. **Global default** (`gbrain config set models.default opus`) — single hammer
-5. **Tier override** (`gbrain config set models.tier.reasoning opus`)
+4. **Tier override** (`gbrain config set models.tier.reasoning opus`) —
+   tier-specific beats the generic default (#3873)
+5. **Global default** (`gbrain config set models.default opus`) — single hammer
 6. Env var (`GBRAIN_MODEL=opus`)
 7. Key-aware tier default (the table above; provider chosen by which keys exist)
 8. Hardcoded caller fallback
@@ -87,6 +88,25 @@ never hardcode a model string. The v0.31.6 chat default
 (`claude-sonnet-4-6-20250929`) was a phantom ID that 404'd the Anthropic
 API and made `extractFactsFromTurn` silently return `[]`. The tier system
 + doctor probe is the structural fix for that bug class.
+
+### A model gbrain has no price for
+
+Under default settings an unpriced model (a newly released one, a proxy
+route) warns and runs. Under a cost cap the user set, the run stops with
+`no_pricing`, because the cap cannot be enforced without a price. The refusal
+names the model, provider and kind and the exact registration command. Then:
+
+1. Look up the provider's current price for that model, for example by
+   searching the web for its pricing page. A chat model needs USD per 1M input
+   tokens and USD per 1M output tokens; an embedding or reranker model needs
+   USD per 1M tokens.
+2. With a shell on the brain host, run the command the refusal names, such as
+   `gbrain pricing set <model> --input <usd> --output <usd> --source <url>`
+   (or `--rate <usd>`), then retry. Over MCP you cannot register prices: give
+   the command and the price you found to the brain's operator.
+
+Do not register $0 to get past the refusal unless the route really is free:
+it makes every call to that model count as free against every cap.
 
 ## 2. Subagent spawn routing
 

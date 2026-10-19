@@ -20,8 +20,13 @@ export const SCHEMA_VERSION = 1 as const;
  *
  * v2 (Lane A1, 2026-05): judge prompt now receives `Statement A (from: YYYY-MM-DD)`
  *   or `(date unknown)` per side. Old v1 verdicts are silently invalidated.
+ * v3 (N2-3, 2026-10): temporal verdicts need two different times; look-alike
+ *   names are different entities.
+ * v4 (N2 undated conflicts, 2026-10): a same-fact check, then a time check
+ *   that forbids ordering two values by size, document kind or listing order;
+ *   a negative claim about one party and a positive claim about another agree.
  */
-export const PROMPT_VERSION = '2' as const;
+export const PROMPT_VERSION = '4' as const;
 
 /** Truncation policy string baked into the cache key. */
 export const TRUNCATION_POLICY = '1500-chars-utf8-safe' as const;
@@ -236,8 +241,18 @@ export interface HotPage {
   max_severity: Severity;
 }
 
+/**
+ * #3889: run-level status. 'judge_failed' when the run produced no verdicts
+ * at all (verdict_breakdown sums to 0) while judge_errors.total > 0 — every
+ * judge call errored, so the "0 contradictions" headline would be a lie.
+ * Optional (append-only): reports persisted before this field lack it.
+ */
+export type RunStatus = 'ok' | 'judge_failed';
+
 export interface ProbeReport {
   schema_version: typeof SCHEMA_VERSION;
+  /** #3889: absent on pre-field persisted rows; treat absent as 'ok'. */
+  run_status?: RunStatus;
   run_id: string;
   judge_model: string;
   prompt_version: string;

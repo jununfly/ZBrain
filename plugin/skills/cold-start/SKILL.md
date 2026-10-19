@@ -37,6 +37,7 @@ writes_to:
   - media/
   - conversations/
   - sources/
+when_to_use: "Use when the user asks: \"cold start\", \"fill my brain\", \"bootstrap brain\", \"bootstrap my data\", \"import my data\"."
 ---
 
 # Cold Start — Day-One Brain Bootstrapping
@@ -51,11 +52,16 @@ sources to get you from zero to useful in one session.
 ## Contract
 
 - Every import phase is gated on user consent (ask-user pattern) before proceeding.
-- **Google/social API access goes through ClawVisor.** The agent never holds raw OAuth
-  tokens or API keys. This is a safety requirement, not a preference. ClawVisor vaults
-  credentials, enforces task-scoped authorization, logs every API call, and requires
-  human approval for destructive operations. If the user doesn't want ClawVisor, the
-  only safe alternative is offline file exports (Google Takeout, Twitter archive download).
+- **The agent never holds raw OAuth tokens or API keys.** This is a safety
+  requirement, not a preference. Three paths satisfy it for Google data:
+  the native connector (`gbrain google setup` — tokens live in gbrain's
+  credential vault, mode 0600, never in the agent's context; see
+  `docs/guides/google-connect.md` and `skills/google-loops/SKILL.md`),
+  ClawVisor (a hosted credential gateway that vaults credentials,
+  enforces task-scoped authorization, logs every API call, and requires
+  human approval for destructive operations — needs a harness with the
+  integration), or offline file exports (Google Takeout, Twitter archive
+  download).
 - Each phase is independently valuable — the user can stop after any phase and still
   have a useful brain.
 - Progress is tracked in `~/.gbrain/cold-start-state.json` so interrupted sessions
@@ -87,9 +93,12 @@ Data sources ranked by **information density × ease of import**:
 
 **Harness check first.** ClawVisor requires an agent host with a ClawVisor
 integration (for example, an OpenClaw deployment). On harnesses without one,
-such as Codex or Claude Code, skip this phase: the documented default for
-Contacts, Calendar, and Gmail is a [Google Takeout](https://takeout.google.com)
-export, which covers all three offline (contacts CSV, calendar ICS, Gmail mbox).
+such as Codex or Claude Code, skip this phase: the default for Contacts,
+Calendar, and Gmail is the native connector — `gbrain google setup` (live
+sync; tokens in gbrain's local credential vault, never with the agent; see
+`skills/google-loops/SKILL.md`) — with a
+[Google Takeout](https://takeout.google.com) export as the offline
+alternative covering all three (contacts CSV, calendar ICS, Gmail mbox).
 Phases 2-4 below document the Takeout path first.
 
 > **Safety boundary:** An AI agent with raw OAuth tokens to your Gmail, Calendar,
@@ -149,15 +158,31 @@ Do NOT fall back to direct OAuth. Instead, proceed with offline-only imports:
 - **Phase 8** (meeting transcripts) — works from exported transcripts
 
 Tell the user:
-> "No problem. We'll work from file-based sources: a Google Takeout export
-> covers Contacts, Calendar, and Gmail. You can set up ClawVisor anytime for
-> live sync instead of point-in-time exports."
+> "No problem. Two options: the native connector (`gbrain google setup`) does
+> live Gmail/Calendar/Contacts sync with your own OAuth app — tokens stay in
+> gbrain's local credential vault, never with me — or a Google Takeout export
+> covers all three as a point-in-time snapshot."
 
-**Do NOT offer direct OAuth as an alternative.** An agent holding raw Google
-tokens is a security liability. The skill should not teach agents to store
-credentials they shouldn't have.
+**Do NOT hold raw Google tokens yourself.** An agent holding tokens in its
+context is a security liability. The native connector is the sanctioned
+OAuth path precisely because gbrain vaults the tokens (0600 file, redacted
+listings) and the agent only ever runs CLI commands; secrets travel by file
+or env intake, never argv or chat. See `skills/google-loops/SKILL.md` for
+the exact protocol.
 
 ## Phase 1: Existing Markdown / Obsidian Import
+
+For an existing company Git repository, use the migrate (host-side) company
+workflow instead of the generic import below. On the trusted brain host, start with
+`gbrain sources inspect <path> --profile company-brain`; confirm an initialized
+company brain and a new source, show the connect destination/access preview, and
+obtain approval before `--yes`. Do not flatten its vocabulary by activating or
+normalizing an unrelated personal schema. The offline `gbrain sources demo
+company-brain` needs no keys or private data. Details:
+`docs/guides/company-brain-ingestion.md`.
+For this company path, stop after reporting the durable receipt; skip the generic
+import and post-bootstrap checklist below. Later enrichment or scheduling needs
+separate consent and must respect the source's immutable keyless sync policy.
 
 **The highest-leverage first import.** If the user already has a notes system, this
 is hundreds or thousands of structured pages ready to go.
@@ -182,7 +207,7 @@ done
 
 ```bash
 # Obsidian vaults are markdown directories — import directly, then wire wikilinks
-# (full flow: skills/migrate/SKILL.md)
+# (full flow: migrate (host-side))
 gbrain import /path/to/vault --no-embed --workers 4
 gbrain extract links --source db      # parses [[wikilinks]] natively
 
@@ -452,7 +477,12 @@ After completing available phases:
    - Calendar: daily cron
    - Email: periodic sweep (4-8 hours)
    - X: daily ingest
-   - Brain repo: `gbrain sync --repo <path>` every 5-30 minutes
+   - Brain repo: `gbrain sync --repo <path>` every 5-30 minutes. A managed brain
+     (`gbrain sources writer status --json` shows `"mode": "managed"`) refuses
+     that line: use the managed recipe in `skills/cron-scheduler/SKILL.md`
+     ("Managed brain") with `--source <id>`, e.g.
+     `gbrain sources refresh <id>; gbrain sync --source <id> --no-pull --hard-deadline 13m`
+     every 15 minutes on the owner host.
 
 4. **Track state:**
    ```json
@@ -475,6 +505,14 @@ After completing available phases:
    > - The **briefing** skill can compile daily context
    > - The **daily-task-prep** skill handles day planning
    > - Say 'enrich [person]' to deep-dive any contact"
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- Every import phase is a user choice: when a command exits 3 (`confirmation_required`) or prints an `[AGENT]` ask, relay the `[SHOW USER]` block and wait; do not chain phases with `--yes`.
+- `gbrain google setup` prints `[SHOW USER]` steps: relay them verbatim and wait for the user to finish the consent click. Credential errors carry their own `fix`; follow it.
+- The first `gbrain query` after an import is empty with a degraded notice: embeddings are off or still backfilling, so the import may have worked. Check `gbrain doctor --json` before telling the user the import failed.
 
 ## Anti-Patterns
 

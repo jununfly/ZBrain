@@ -10,6 +10,7 @@
  */
 
 import type { ProgressOptions } from './progress.ts';
+import { opError } from './ops/contract.ts';
 
 export interface CliOptions {
   quiet: boolean;
@@ -38,6 +39,15 @@ export interface CliOptions {
    * via src/core/brain-resolver.ts.
    */
   brain: string | null;
+  /**
+   * #5232: `--wait <seconds>` — how long a write waits for its commit before
+   * the CLI reports it pending (persistence/write-wait.ts). `null` = resolve
+   * GBRAIN_WRITE_WAIT_MS / persistence.write_wait_ms / the 30 s default. Unset when
+   * the flag is absent.
+   */
+  writeWaitMs?: number | null;
+  /** #5232: `--accept-pending` (true) / `--no-accept-pending` (false); unset = GBRAIN_ACCEPT_PENDING. */
+  acceptPending?: boolean | null;
 }
 
 export const DEFAULT_CLI_OPTIONS: CliOptions = {
@@ -48,6 +58,17 @@ export const DEFAULT_CLI_OPTIONS: CliOptions = {
   explain: false,
   brain: null,
 };
+
+/** `--wait` takes seconds (`--wait 45`, `--wait 2.5`), 0 to 600. A malformed value is a usage error (exit 2). */
+function parseWaitSeconds(val: string | undefined): number {
+  const seconds = val !== undefined && /^\d+(?:\.\d+)?$/.test(val) ? Number(val) : NaN;
+  if (!Number.isFinite(seconds) || seconds > 600) {
+    throw opError('invalid_params',
+      `--wait requires a number of seconds from 0 to 600, no units (got ${val === undefined ? 'nothing' : JSON.stringify(val)}).`,
+      'Give --wait seconds with no unit, for example --wait 45 or --wait 300 for five minutes.');
+  }
+  return Math.round(seconds * 1000);
+}
 
 /**
  * Brain-id shape. Same regex as brain-registry's BRAIN_ID_RE (kept in sync;
@@ -93,6 +114,32 @@ function parseBrainValue(val: string | undefined): string {
  */
 export const TIMEOUT_OWNING_COMMANDS = new Set(['sync', 'remote']);
 
+/**
+ * #4541: commands whose result formatter consumes the GLOBAL --explain (the
+ * v0.40.4 per-stage search attribution view in cli.ts's query/search
+ * formatter; `ask` is the query alias rewritten before dispatch). For every
+ * OTHER command the global parser hands the flag back IN PLACE — `extract
+ * --explain <kind>`, `whoknows --explain`, and `onboard --check --explain`
+ * parse it themselves, and the blanket claim starved them: `extract
+ * --explain timeline` fell through to the WRITE-pass extraction instead of
+ * the explain view.
+ *
+ * wave-g: `call` claims it too — `gbrain call <op>` maps leftover argv into
+ * op params, so a handed-back --explain would surface as an
+ * unknown-parameter error instead of being ignored (the pre-#4541 global
+ * behavior for `call query --explain`).
+ */
+export const EXPLAIN_CLAIMING_COMMANDS = new Set(['query', 'search', 'ask', 'call']);
+
+/**
+ * #6625: command routes whose own parser reads `--wait` (a duration such as
+ * `5m`, not the #5232 write wait in seconds). For these the global parser
+ * hands every `--wait` back, appended in the space-separated spelling;
+ * everyone else keeps the global write wait. Matched on the leading plain
+ * tokens, so `sources writer movement` owns it and `sources list` does not.
+ */
+export const WAIT_OWNING_ROUTES: readonly (readonly string[])[] = [['sources', 'writer', 'movement']];
+
 export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: string[] } {
   const cliOpts: CliOptions = { ...DEFAULT_CLI_OPTIONS };
   // #3013: --timeout can't be resolved inline — whether the GLOBAL parser
@@ -102,7 +149,9 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
   // a second pass below.
   type Slot =
     | { plain: string }
-    | { timeoutValue: string; equalsForm: boolean };
+    | { timeoutValue: string; equalsForm: boolean }
+    | { explainFlag: true }
+    | { waitValue: string | undefined };
   const slots: Slot[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -151,8 +200,10 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       continue;
     }
     // v0.40.4 — --explain for `gbrain search/query` per-stage attribution.
+    // #4541: like --timeout, whether the global parser claims it depends on
+    // the command, which is only known after the full scan — slot it.
     if (a === '--explain') {
-      cliOpts.explain = true;
+      slots.push({ explainFlag: true });
       continue;
     }
     // --brain <id> / --brain=<id> — brain (database) axis. Exact-match only:
@@ -167,6 +218,22 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
     }
     if (a.startsWith('--brain=')) {
       cliOpts.brain = parseBrainValue(a.slice('--brain='.length));
+      continue;
+    }
+    // #5232 write wait + pending opt-in. Global like --timeout so every write
+    // lane (generated ops, call, capture, remember, takes) reads one value.
+    // #6625: slotted like --timeout, since `sources writer movement` owns its own --wait.
+    if (a === '--wait') {
+      slots.push({ waitValue: argv[i + 1] });
+      i++;
+      continue;
+    }
+    if (a.startsWith('--wait=')) {
+      slots.push({ waitValue: a.slice('--wait='.length) });
+      continue;
+    }
+    if (a === '--accept-pending' || a === '--no-accept-pending') {
+      cliOpts.acceptPending = a === '--accept-pending';
       continue;
     }
     slots.push({ plain: a });
@@ -190,12 +257,58 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
   const commandSlot = slots.find((s): s is { plain: string } => 'plain' in s);
   const commandOwnsTimeout =
     commandSlot !== undefined && TIMEOUT_OWNING_COMMANDS.has(commandSlot.plain);
+  // #4541: only the search/query formatter commands claim --explain globally;
+  // everyone else gets it back in place (extract/whoknows/onboard own it).
+  const commandClaimsExplain =
+    commandSlot !== undefined && EXPLAIN_CLAIMING_COMMANDS.has(commandSlot.plain);
+  const leading = slots.filter((s): s is { plain: string } => 'plain' in s).map(s => s.plain);
+  const routeOwnsWait = WAIT_OWNING_ROUTES.some(route => route.every((token, i) => leading[i] === token));
 
   const rest: string[] = [];
   const handback: string[] = [];
+  // #4557: a handed-back --explain that arrived BEFORE the command token
+  // (`gbrain --explain extract timeline`, the documented global-flag-first
+  // invocation style) must not be re-inserted at its original position —
+  // that puts it at rest[0], and cli.ts dispatches on `args[0]` as the
+  // command, so the literal string '--explain' gets treated as the command
+  // and dispatch breaks for every non-claiming command. Defer it until the
+  // command slot is emitted, then flush right after — this reproduces
+  // `<command> --explain ...` exactly as if the user had typed it there. An
+  // --explain that arrives AFTER the command (`extract --explain timeline`,
+  // already correct today) is left in its natural scanned position: moving
+  // it further (e.g. to the very end like the --timeout handback) would
+  // change its position relative to a following value token, and
+  // extract-explain.ts's kind lookup is positional
+  // (`args.indexOf('--explain') + 1`) — reordering it "just to be safe"
+  // would break the case that already works.
+  const deferredExplain: string[] = [];
+  let commandEmitted = false;
   for (const s of slots) {
     if ('plain' in s) {
       rest.push(s.plain);
+      if (s === commandSlot) {
+        commandEmitted = true;
+        if (deferredExplain.length > 0) {
+          rest.push(...deferredExplain);
+          deferredExplain.length = 0;
+        }
+      }
+      continue;
+    }
+    if ('explainFlag' in s) {
+      if (commandClaimsExplain) {
+        cliOpts.explain = true;
+      } else if (commandEmitted) {
+        rest.push('--explain');
+      } else {
+        deferredExplain.push('--explain');
+      }
+      continue;
+    }
+    if ('waitValue' in s) {
+      if (!routeOwnsWait) cliOpts.writeWaitMs = parseWaitSeconds(s.waitValue);
+      else if (s.waitValue === undefined) handback.push('--wait');
+      else handback.push('--wait', s.waitValue);
       continue;
     }
     if (commandOwnsTimeout) {
@@ -211,6 +324,9 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       rest.push('--timeout', s.timeoutValue);
     }
   }
+  // No plain (command) slot was ever found — nothing to flush against, so
+  // any deferred --explain(s) go at the end (there's no command to garble).
+  rest.push(...deferredExplain);
   rest.push(...handback);
 
   return { cliOpts, rest };
@@ -329,6 +445,7 @@ export function childGlobalFlags(cliOpts?: CliOptions): string {
 // ============================================================
 
 import type { BrainEngine } from './engine.ts';
+import type { SpendAuthorization } from './minions/spend-record.ts';
 import { createHash } from 'crypto';
 
 export interface MaybeBackgroundOpts {
@@ -338,7 +455,13 @@ export interface MaybeBackgroundOpts {
   paramBuilder: (args: string[]) => Record<string, unknown>;
   /** Source id for the idempotency key namespace. Default 'cli'. */
   source?: string;
+  /** The user's spend authorization for a consent-gated paid job (stored on the row, never in data). */
+  spendAuthorization?: SpendAuthorization;
 }
+
+let lastBackgroundJobId: number | null = null;
+/** D2: the job `maybeBackground` submitted in this process (for `--json` result documents). */
+export function lastBackgroundJob(): number | null { return lastBackgroundJobId; }
 
 /**
  * If `--background` is in args, submit a Minion job and return true
@@ -379,18 +502,21 @@ export async function maybeBackground(opts: MaybeBackgroundOpts): Promise<boolea
       queue: 'default',
       idempotency_key,
       max_attempts: 2,
-    });
+    }, opts.spendAuthorization ? { spendAuthorization: opts.spendAuthorization } : undefined);
     process.stdout.write(`job_id=${job.id}\n`);
+    if (opts.spendAuthorization) {
+      const { spendSubmitSummary } = await import('./minions/spend-authorization.ts');
+      for (const line of spendSubmitSummary(opts.spendAuthorization, [job], opts.spendAuthorization.argv ?? []).lines) process.stderr.write(`${line}\n`);
+    }
+    lastBackgroundJobId = job.id;
 
     if (follow) {
       // exec `gbrain jobs follow <id>` so the user sees live stream
       // without losing the durable-queue submission.
-      const { spawn } = await import('child_process');
+      const { spawnCliChild } = await import('./cli-force-exit.ts');
       const cmd = process.argv[0] ?? 'bun';
       const script = process.argv[1] ?? '';
-      const child = spawn(cmd, [script, 'jobs', 'follow', String(job.id)], {
-        stdio: 'inherit',
-      });
+      const child = spawnCliChild(cmd, [script, 'jobs', 'follow', String(job.id)]);
       await new Promise<void>((resolve) => child.on('exit', () => resolve()));
     }
     return true;  // caller exits

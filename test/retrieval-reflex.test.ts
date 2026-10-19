@@ -230,6 +230,79 @@ describe('context-engine assemble() — Retrieval Reflex integration', () => {
     });
   });
 
+  test('turn delivered via `prompt` with empty `messages` still fires the reflex (codex-app-server path)', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-prompt',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      // Runtimes like the codex-app-server (2026.7.x) deliver the current turn
+      // via `prompt` and leave `messages` empty. The reflex must still see it.
+      const res = await ce.assemble({
+        sessionId: 's-prompt',
+        messages: [],
+        prompt: 'what do you think about Alice Example?',
+      });
+      expect(res.systemPromptAddition).toContain('Brain pages mentioned this turn');
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+    });
+  });
+
+  test('the separate current prompt wins over a historical user message without changing caller messages', async () => {
+    await withEnv({ ...REFLEX_ON, GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS: '1', GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER: 'false' }, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      await seed('people/bob-example', 'Bob Example', 'Bob is a founder.');
+      const seen: string[] = [];
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-prompt-ignored',
+        resolveEntities: (candidates, opts) => {
+          seen.push(...candidates.map((c) => c.query));
+          return resolveEntitiesToPointers(engine, 'default', candidates, opts);
+        },
+      });
+      const messages = [{ role: 'user', content: 'what do you think about Alice Example?' }];
+      const res = await ce.assemble({
+        sessionId: 's-prompt-ignored',
+        messages,
+        prompt: 'tell me about Bob Example',
+      });
+      expect(res.systemPromptAddition).toContain('people/bob-example');
+      expect(seen.join(' ')).not.toContain('Alice Example');
+      expect(seen.join(' ')).toContain('Bob Example');
+      expect(res.messages).toBe(messages);
+      expect(messages).toHaveLength(1);
+    });
+  });
+
+  test('fenced repeated text remains historical while a legacy included current turn is not duplicated', async () => {
+    await withEnv({ ...REFLEX_ON, GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS: '1', GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER: 'false' }, async () => {
+      const prompt = 'tell me about Alice Example';
+      const messages = [{ role: 'user', content: prompt }];
+      const seen: Array<{ priorContextText?: string; candidates: string[] }> = [];
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-repeat',
+        resolveEntities: async (candidates, opts) => {
+          seen.push({ priorContextText: opts.priorContextText, candidates: candidates.map((candidate) => candidate.query) });
+          return null;
+        },
+      });
+      const fenced = await ce.assemble({ sessionId: '', messages, prompt, runtimeContext: { transcriptStorage: { kind: 'sqlite' } } });
+      expect(seen[0].priorContextText).toBe(prompt);
+      expect(seen[0].candidates.filter((candidate) => candidate === 'Alice Example')).toHaveLength(1);
+      expect(fenced.messages).toBe(messages);
+      const legacy = await ce.assemble({ sessionId: '', messages, prompt });
+      expect(seen[1].priorContextText).toBe('');
+      expect(seen[1].candidates.filter((candidate) => candidate === 'Alice Example')).toHaveLength(1);
+      expect(legacy.messages).toBe(messages);
+      const absent = await ce.assemble({ sessionId: '', messages });
+      expect(seen[2]).toEqual(seen[1]);
+      expect(absent.messages).toBe(messages);
+      expect(messages).toEqual([{ role: 'user', content: prompt }]);
+    });
+  });
+
   test('no resolver available (PGLite, no serve/host) → no throw, live context still present', async () => {
     await withEnv(REFLEX_ON, async () => {
       const ce = createGBrainContextEngine({ workspaceDir: '/tmp/rr-test-ws-2' });
@@ -669,5 +742,129 @@ describe('v0.46.15 ship-review hardening (adversarial F1/F2 + stale-alias veto)'
       { sourceIds: ['default', 'other'] },
     );
     expect(block).toBeNull();
+  });
+});
+
+describe('#3746 — cjk-title arm (pure-CJK weak norms probe exact title/slug)', () => {
+  test('japanese: unregistered-alias page resolves via exact title', async () => {
+    await seed('people/tanaka', '田中', '田中 is a partner at fund-a.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('people/tanaka');
+    expect(block!.pointers[0].arm).toBe('cjk-title');
+    expect(block!.pointers[0].confidence).toBeGreaterThanOrEqual(0.7); // survives the volunteer gate
+    expect(block!.pointers[0].matchedNorm).toBe(normalizeAlias('田中'));
+  });
+
+  test('korean: registered CJK alias resolves through the alias arm (0.9)', async () => {
+    await seed('people/kim-chulsoo', 'Kim Chulsoo', 'A founder.');
+    await engine.setPageAliases('people/kim-chulsoo', 'default', [normalizeAlias('김철수')]);
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('김철수 미팅 노트 보여줘'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('people/kim-chulsoo');
+    expect(block!.pointers[0].arm).toBe('alias');
+  });
+
+  test('chinese: exact CJK slug resolves when the title differs', async () => {
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES ('王小明', 'default', 'person', 'Wang Xiaoming', 'A researcher.', '')`,
+      [],
+    );
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('给我看看王小明的笔记'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('王小明');
+    expect(block!.pointers[0].arm).toBe('cjk-title');
+  });
+
+  test('no matching page → resolves nothing (junk grams never fabricate)', async () => {
+    await seed('people/unrelated', 'Unrelated Person', 'Nothing CJK here.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('ambiguous gram (two pages share the title) injects nothing', async () => {
+    await seed('people/tanaka-a', '田中', 'First 田中.');
+    await seed('people/tanaka-b', '田中', 'Second 田中.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('kill switch: lexicalArms=false disables the cjk-title arm', async () => {
+    await seed('people/tanaka', '田中', '田中 is a partner.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      { lexicalArms: false },
+    );
+    expect(block).toBeNull();
+  });
+});
+
+// #6195: lowercase multi-word names ("call alice example") volunteer through 2-3-word weak
+// n-grams: the exact alias arm, and an exact-title arm limited to entity types with a globally
+// unique title. Single lowercase words stay alias-only.
+describe('lowercase multi-word names (#6195)', () => {
+  async function seedTyped(slug: string, title: string, type: string) {
+    await engine.executeRaw(`INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline) VALUES ($1, 'default', $2, $3, 'Body.', '')`, [slug, type, title]);
+  }
+
+  test('a lowercase multi-word alias or entity title volunteers; a single lowercase word does not', async () => {
+    await seed('people/alice-example', 'Alice Example', 'A founder.');
+    await engine.setPageAliases('people/alice-example', 'default', [normalizeAlias('Alice Sample')]);
+    const viaAlias = await resolveEntitiesToPointers(engine, 'default', extractCandidates('did alice sample reply'), {});
+    expect(viaAlias?.pointers.map((p) => [p.slug, p.arm])).toEqual([['people/alice-example', 'alias']]);
+    const viaTitle = await resolveEntitiesToPointers(engine, 'default', extractCandidates('call alice example tomorrow'), {});
+    expect(viaTitle?.pointers.map((p) => [p.slug, p.arm])).toEqual([['people/alice-example', 'weak-title']]);
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('ask alice about it'), {})).toBeNull();
+  });
+
+  test('a non-entity or ambiguous title does not volunteer, and the kill switch turns the arm off', async () => {
+    await seedTyped('concepts/open-source', 'Open Source', 'concept');
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('we like open source tools'), {})).toBeNull();
+    await seedTyped('companies/acme-example', 'Acme Example', 'company');
+    await seedTyped('people/acme-example', 'Acme Example', 'person');
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('met acme example today'), {})).toBeNull();
+    await seed('people/alice-example', 'Alice Example', 'A founder.');
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('call alice example'), { lexicalArms: false })).toBeNull();
+  });
+
+  test('a private entity page is hidden from the weak-title arm by default', async () => {
+    await engine.executeRaw(`INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline, frontmatter)
+      VALUES ('people/zora-example', 'default', 'person', 'Zora Example', 'Body.', '', '{"visibility":"private"}'::jsonb)`);
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('call zora example'), {})).toBeNull();
+    const trusted = await resolveEntitiesToPointers(engine, 'default', extractCandidates('call zora example'), { excludePrivate: false });
+    expect(trusted?.pointers[0].slug).toBe('people/zora-example');
+  });
+
+  test('punctuation breaks an n-gram', () => {
+    const grams = extractCandidates('thanks alice, example follows').filter((c) => c.weak && c.query.includes(' ')).map((c) => c.query);
+    expect(grams).not.toContain('alice example');
   });
 });

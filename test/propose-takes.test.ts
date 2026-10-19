@@ -19,10 +19,11 @@ import { withEnv, emptyHome } from './helpers/with-env.ts';
 import {
   runPhaseProposeTakes,
   parseExtractorOutput,
+  EXTRACT_TAKES_PROMPT,
   contentHash,
   hasCompleteFence,
   extractExistingTakesForDedup,
-  isWellFormedEmptyExtraction,
+  extractorOutcome,
   PROPOSE_TAKES_PROMPT_VERSION,
   EMPTY_EXTRACTION_TOMBSTONE_TEXT,
   resolveProposeTakesDeadlineMs,
@@ -59,6 +60,7 @@ function buildMockEngine(opts: {
     },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
+      if (sql.includes('FROM persistence_brain')) return [{ enabled: false } as unknown as T]; // #6482: the strict mode reader needs one well-formed unmanaged row.
       // Narrow candidate-page projection (replaces listPages in the phase).
       if (sql.includes('SELECT slug, source_id, compiled_truth')) {
         return opts.pages.map((p) => ({
@@ -186,6 +188,50 @@ describe('parseExtractorOutput', () => {
     expect(out[0]!.domain).toBe('macro');
   });
 
+  // #4736 — the prompt's kind vocabulary and the parser's allowlist must
+  // never diverge again: every kind token the prompt instructs the model to
+  // emit must survive parsing with its provenance intact (NOT be silently
+  // coerced to the default 'take').
+  test('every kind token in EXTRACT_TAKES_PROMPT is accepted, not coerced (#4736)', () => {
+    const kindLine = EXTRACT_TAKES_PROMPT.split('\n').find((l) => l.trim().startsWith('- kind'));
+    expect(kindLine).toBeDefined();
+    const tokens = [...kindLine!.matchAll(/'([a-z]+)'/g)].map((m) => m[1]!);
+    expect(tokens.length).toBeGreaterThanOrEqual(2);
+    for (const token of tokens) {
+      const out = parseExtractorOutput(
+        JSON.stringify([{ claim_text: `claim of kind ${token}`, kind: token, holder: 'brain', weight: 0.6 }]),
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]!.kind).toBe(token as ProposedTake['kind']);
+    }
+  });
+
+  test('legacy prompt kinds (prediction/judgment) map onto the fence vocabulary (#4736)', () => {
+    // Cached / old-model outputs still emit the pre-#4736 prompt vocabulary;
+    // they classify deterministically instead of relying on blind coercion.
+    const legacy: Array<[string, ProposedTake['kind']]> = [
+      ['prediction', 'take'],
+      ['judgment', 'take'],
+    ];
+    for (const [legacyKind, mapped] of legacy) {
+      const out = parseExtractorOutput(
+        JSON.stringify([{ claim_text: 'x', kind: legacyKind, holder: 'brain', weight: 0.5 }]),
+      );
+      expect(out[0]!.kind).toBe(mapped);
+    }
+  });
+
+  test('kind matching is case/whitespace-insensitive (#4736)', () => {
+    const out = parseExtractorOutput(
+      JSON.stringify([
+        { claim_text: 'a', kind: 'Bet', holder: 'brain', weight: 0.5 },
+        { claim_text: 'b', kind: ' hunch ', holder: 'brain', weight: 0.5 },
+      ]),
+    );
+    expect(out[0]!.kind).toBe('bet');
+    expect(out[1]!.kind).toBe('hunch');
+  });
+
   test('strips <think> reasoning tags before parsing (MiniMax-M3, DeepSeek-R1)', () => {
     const raw = '<think>Analyzing the prose... I see several claims.</think>\n\n```json\n[{"claim_text":"X","kind":"take","holder":"brain","weight":0.5}]\n```';
     const out = parseExtractorOutput(raw);
@@ -205,51 +251,75 @@ describe('parseExtractorOutput', () => {
     expect(out).toHaveLength(1);
     expect(out[0]!.claim_text).toBe('Z');
   });
+
+  // #5209: recovery must stop at the value's own closing bracket; the last
+  // `]`/`}` in the reply can belong to prose after it.
+  const take = (claim: string, kind = 'take') => JSON.stringify({ claim_text: claim, kind, holder: 'brain', weight: 0.7 });
+
+  test('an array followed by a numbered citation keeps its takes', () => {
+    const out = parseExtractorOutput(`[${take('Pricing beats features')},${take('Hiring lags plan', 'bet')}]\n[1] board memo`);
+    expect(out.map(t => [t.claim_text, t.kind])).toEqual([['Pricing beats features', 'take'], ['Hiring lags plan', 'bet']]);
+  });
+
+  test('a lone object followed by a stray `]` is recovered', () => {
+    const out = parseExtractorOutput(`${take('Churn is seasonal', 'hunch')}\n]`);
+    expect(out.map(t => t.claim_text)).toEqual(['Churn is seasonal']);
+  });
+
+  test('brackets, braces and an escaped quote inside claim_text', () => {
+    const claim = 'Ratio {a]/[b} is "stable"';
+    const out = parseExtractorOutput(`[${take(claim)}] per [[companies/acme-example]]`);
+    expect(out.map(t => t.claim_text)).toEqual([claim]);
+  });
+
+  test('control: a cut-off array followed by a citation still yields nothing', () => {
+    expect(parseExtractorOutput(`[${take('A')},{"claim_text":"B"\nSee [Source: memo]`)).toEqual([]);
+  });
 });
 
-// ─── isWellFormedEmptyExtraction ────────────────────────────────────
+// ─── extractorOutcome: the empty-extraction decision ───────────────
 // Guards the tombstone against permanently memoizing a transient parse
 // failure as "no claims". Only a cleanly-parsed empty array counts as a
 // genuine empty extraction; malformed/prose/truncated output must not.
 
-describe('isWellFormedEmptyExtraction', () => {
+describe('extractorOutcome valid_empty (the tombstone decision)', () => {
   test('true for a clean empty array (the well-behaved "no claims" response)', () => {
-    expect(isWellFormedEmptyExtraction('[]')).toBe(true);
-    expect(isWellFormedEmptyExtraction('  []  ')).toBe(true);
-    expect(isWellFormedEmptyExtraction('[   ]')).toBe(true);
+    expect(extractorOutcome('[]').kind).toBe('valid_empty');
+    expect(extractorOutcome('  []  ').kind).toBe('valid_empty');
+    expect(extractorOutcome('[   ]').kind).toBe('valid_empty');
   });
 
   test('true for a fenced empty array', () => {
-    expect(isWellFormedEmptyExtraction('```json\n[]\n```')).toBe(true);
+    expect(extractorOutcome('```json\n[]\n```').kind).toBe('valid_empty');
   });
 
   test('true for leading prose then an empty array', () => {
-    expect(isWellFormedEmptyExtraction('No gradeable claims.\n\n[]')).toBe(true);
+    expect(extractorOutcome('No gradeable claims.\n\n[]').kind).toBe('valid_empty');
   });
 
   test('false for empty / whitespace output (transient, must retry)', () => {
-    expect(isWellFormedEmptyExtraction('')).toBe(false);
-    expect(isWellFormedEmptyExtraction('   \n  ')).toBe(false);
+    expect(extractorOutcome('').kind).not.toBe('valid_empty');
+    expect(extractorOutcome('   \n  ').kind).not.toBe('valid_empty');
   });
 
   test('false for prose-only / non-JSON output (transient, must retry)', () => {
-    expect(isWellFormedEmptyExtraction('There are no gradeable claims here.')).toBe(false);
-    expect(isWellFormedEmptyExtraction('null')).toBe(false);
+    expect(extractorOutcome('There are no gradeable claims here.').kind).not.toBe('valid_empty');
+    expect(extractorOutcome('null').kind).not.toBe('valid_empty');
   });
 
   test('false for malformed / truncated JSON (transient, must retry)', () => {
-    expect(isWellFormedEmptyExtraction('[')).toBe(false);
-    expect(isWellFormedEmptyExtraction('[{"claim_text":"x"')).toBe(false);
+    expect(extractorOutcome('[').kind).not.toBe('valid_empty');
+    expect(extractorOutcome('[{"claim_text":"x"').kind).not.toBe('valid_empty');
   });
 
   test('false for a NON-empty array (has content — not an empty extraction)', () => {
-    expect(isWellFormedEmptyExtraction('[{"claim_text":"x","kind":"take","holder":"brain","weight":0.5}]')).toBe(false);
+    expect(extractorOutcome('[{"claim_text":"x","kind":"take","holder":"brain","weight":0.5}]').kind).not.toBe('valid_empty');
     // Parseable but claim-less array is ambiguous garbage → not a genuine empty.
-    expect(isWellFormedEmptyExtraction('[{"foo":"bar"}]')).toBe(false);
+    expect(extractorOutcome('[{"foo":"bar"}]').kind).not.toBe('valid_empty');
   });
 
   test('false for an empty object (model ignored the array-format instruction)', () => {
-    expect(isWellFormedEmptyExtraction('{}')).toBe(false);
+    expect(extractorOutcome('{}').kind).not.toBe('valid_empty');
   });
 });
 
@@ -503,12 +573,15 @@ New prose appended here.`;
     expect(extractorCalls).toBe(1);
     expect((details.warnings as string[]).some(w => w.includes('phase deadline hit'))).toBe(true);
 
-    // Rollup records the deadline break as a halt, not a completed round
-    // (same posture as budget exhaustion). Params: $5 = halt, $8 = completed.
+    // #4482 three-way stop classification: a deadline cap is the extractor
+    // working as designed (partial progress banked) — recorded as an
+    // expected_limit, NOT a halt and NOT a completed round (same posture as
+    // budget exhaustion). Params: $5 = halt, $8 = completed, $9 = expected_limit.
     const rollup = captured.find((c) => c.sql.includes('extract_rollup_7d'));
     expect(rollup).toBeDefined();
-    expect(rollup!.params[4]).toBe(1); // halt_count delta
+    expect(rollup!.params[4]).toBe(0); // halt_count delta (error halts only)
     expect(rollup!.params[7]).toBe(0); // round_completed delta
+    expect(rollup!.params[8]).toBe(1); // expected_limit delta (deadline cap)
   });
 
   test('default deadline does not fire on a fast run', async () => {
@@ -578,7 +651,9 @@ New prose appended here.`;
 
       const result = await runPhaseProposeTakes(buildCtx(engine), {
         extractor,
-        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes' }),
+        // The OpenRouter alias is not in the canonical pricing table; the
+        // opt-in bypass keeps this test about model-id preservation (C-16).
+        meter: new BudgetMeter({ budgetUsd: 0.000001, phase: 'propose_takes', allowUnpriced: true }),
       });
 
       expect(result.status).toBe('ok');
@@ -605,6 +680,25 @@ New prose appended here.`;
         expect(result.status).toBe('skipped');
         expect((result.details as Record<string, unknown>).reason).toBe('no_provider');
         // Skips BEFORE touching the engine — no page scan, no cache probes.
+        expect(captured).toHaveLength(0);
+      } finally {
+        resetGateway();
+      }
+    });
+  });
+
+  test('default extractor skips cleanly when a non-Anthropic chat model has no key (#6705)', async () => {
+    await withEnv({ GBRAIN_HOME: emptyHome(), OPENAI_API_KEY: undefined }, async () => {
+      configureGateway({ chat_model: 'openai:gpt-5.6', env: {} });
+      try {
+        const { engine, captured } = buildMockEngine({
+          pages: [buildPage({ slug: 'wiki/c', body: 'claim-ish prose' })],
+        });
+        const result = await runPhaseProposeTakes(buildCtx(engine));
+
+        expect(result.status).toBe('skipped');
+        expect((result.details as Record<string, unknown>).reason).toBe('no_provider');
+        expect(result.summary).toContain('OPENAI_API_KEY');
         expect(captured).toHaveLength(0);
       } finally {
         resetGateway();
@@ -975,5 +1069,143 @@ describe('runPhaseProposeTakes — global-error halt (#3044)', () => {
     expect(details.aborted_global_error).toBeUndefined();
     expect(result.status).toBe('warn'); // still surfaced as a warning
     expect(result.summary).not.toContain('aborted on');
+  });
+});
+
+// ─── #4312: pricing.overrides reach the base-phase budget gate ─────
+
+describe('pricing.overrides reach the base-phase meter (#4312)', () => {
+  test('a $0 operator override lets a capped phase run instead of exhausting at list price', async () => {
+    configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'test-key' } });
+    try {
+      const run = async (overrides: string | null) => {
+        const pages = [buildPage({ slug: 'wiki/override', body: 'an operator rate should price the gate' })];
+        const { engine, captured } = buildMockEngine({ pages });
+        (engine as unknown as { getConfig: (k: string) => Promise<string | null> }).getConfig =
+          async (k: string) => (k === 'pricing.overrides' ? overrides : null);
+        const extractor: ProposeTakesExtractor = async () => [
+          { claim_text: 'an operator rate should price the gate', kind: 'take', holder: 'brain', weight: 0.5 },
+        ];
+        const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, budgetUsd: 0.000001 });
+        return { result, inserted: captured.some(c => c.sql.includes('INSERT INTO take_proposals')) };
+      };
+      // Control: at list price the cap is binding.
+      const listed = await run(null);
+      expect(listed.result.details.budget_exhausted).toBe(true);
+      expect(listed.inserted).toBe(false);
+      // With the operator's $0 rate the same cap admits the call.
+      const priced = await run('{"anthropic:claude-sonnet-4-6": 0}');
+      expect(priced.result.details.budget_exhausted).toBe(false);
+      expect(priced.inserted).toBe(true);
+    } finally {
+      resetGateway();
+    }
+  });
+});
+
+// ─── #4102: cycle.propose_takes.enabled off switch ─────────────────
+
+describe('cycle.propose_takes.enabled gate (#4102)', () => {
+  function stubConfig(engine: BrainEngine, value: string | null): void {
+    (engine as unknown as { getConfig: (k: string) => Promise<string | null> }).getConfig =
+      async (k: string) => (k === 'cycle.propose_takes.enabled' ? value : null);
+  }
+
+  function countingExtractor(): { extractor: ProposeTakesExtractor; calls: () => number } {
+    let n = 0;
+    return {
+      extractor: async () => { n += 1; return []; },
+      calls: () => n,
+    };
+  }
+
+  test('explicit false skips before any extractor call or DB write', async () => {
+    const pages = [buildPage({ slug: 'wiki/gated', body: 'Some gated prose.' })];
+    const { engine, captured } = buildMockEngine({ pages });
+    stubConfig(engine, 'false');
+    const { extractor, calls } = countingExtractor();
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    expect(result.status).toBe('skipped');
+    const details = result.details as Record<string, unknown>;
+    expect(details.reason).toBe('disabled');
+    expect(String(details.enable_hint)).toContain('cycle.propose_takes.enabled');
+    expect(calls()).toBe(0);
+    expect(captured.filter(c => c.sql.includes('take_proposals'))).toHaveLength(0);
+  });
+
+  test("'0' and 'off' also skip (isConfigTruthy semantics)", async () => {
+    for (const value of ['0', 'off', 'no']) {
+      const pages = [buildPage({ slug: 'wiki/gated2', body: 'prose' })];
+      const { engine } = buildMockEngine({ pages });
+      stubConfig(engine, value);
+      const { extractor, calls } = countingExtractor();
+      const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+      expect(result.status).toBe('skipped');
+      expect(calls()).toBe(0);
+    }
+  });
+
+  test('unset (null) = default ON: the phase runs', async () => {
+    const pages = [buildPage({ slug: 'wiki/ungated', body: 'Some prose worth scanning.' })];
+    const { engine } = buildMockEngine({ pages });
+    stubConfig(engine, null);
+    const { extractor, calls } = countingExtractor();
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    expect(result.status).not.toBe('skipped');
+    expect(calls()).toBe(1);
+  });
+
+  test("explicit 'true' runs", async () => {
+    const pages = [buildPage({ slug: 'wiki/on', body: 'More prose.' })];
+    const { engine } = buildMockEngine({ pages });
+    stubConfig(engine, 'true');
+    const { extractor, calls } = countingExtractor();
+    await runPhaseProposeTakes(buildCtx(engine), { extractor });
+    expect(calls()).toBe(1);
+  });
+
+  test('once:true bypasses an explicit false for this run only', async () => {
+    const pages = [buildPage({ slug: 'wiki/once', body: 'Once-run prose.' })];
+    const { engine } = buildMockEngine({ pages });
+    stubConfig(engine, 'false');
+    const { extractor, calls } = countingExtractor();
+    const result = await runPhaseProposeTakes(buildCtx(engine), { extractor, once: true });
+    expect(result.status).not.toBe('skipped');
+    expect(calls()).toBe(1);
+  });
+});
+
+// ─── #4823: `gbrain dream --dry-run` promises "no writes" ────────────
+// BaseCyclePhase.run() must skip every subclass (propose_takes / grade_takes /
+// calibration_profile) under dry-run — they bill LLM calls and INSERT rows and
+// have no dry-run path of their own — the same shape extract uses.
+
+describe('runPhaseProposeTakes — dry-run (#4823)', () => {
+  function armedEngine(): { engine: BrainEngine; calls: () => number } {
+    let calls = 0;
+    const engine = {
+      kind: 'pglite',
+      async executeRaw() { calls++; throw new Error('executeRaw must not run under dry-run'); },
+      async listPages() { calls++; throw new Error('listPages must not run under dry-run'); },
+    } as unknown as BrainEngine;
+    return { engine, calls: () => calls };
+  }
+  const meter = () => new BudgetMeter({ budgetUsd: 1, phase: 'propose_takes' });
+
+  test('opts.dryRun: skipped with no_dry_run_support; engine never touched', async () => {
+    const { engine, calls } = armedEngine();
+    const r = await runPhaseProposeTakes(buildCtx(engine), { dryRun: true, meter: meter() });
+    expect(r.status).toBe('skipped');
+    expect(r.details.reason).toBe('no_dry_run_support');
+    expect(r.details.dryRun).toBe(true);
+    expect(calls()).toBe(0);
+  });
+
+  test('ctx.dryRun alone (caller forgot to thread opts): still skipped; engine never touched', async () => {
+    const { engine, calls } = armedEngine();
+    const r = await runPhaseProposeTakes({ ...buildCtx(engine), dryRun: true }, { meter: meter() });
+    expect(r.status).toBe('skipped');
+    expect(r.details.reason).toBe('no_dry_run_support');
+    expect(calls()).toBe(0);
   });
 });

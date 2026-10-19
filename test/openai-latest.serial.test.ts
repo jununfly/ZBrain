@@ -4,7 +4,17 @@
  * GBRAIN_HOME + process env + module memo state.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  mkdtempSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  statSync,
+  utimesSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -15,8 +25,9 @@ import {
   _resetOpenAILatestForTests,
 } from '../src/core/ai/openai-latest.ts';
 import { resolveTierDefault, openaiStaticTierFallback } from '../src/core/model-config.ts';
+import { configDir } from '../src/core/config.ts';
 
-const PINNED = ['GBRAIN_HOME', 'GBRAIN_MODEL_DISCOVERY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'] as const;
+const PINNED = ['GBRAIN_HOME', 'GBRAIN_MODEL_DISCOVERY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'CLAUDE_CONFIG_DIR'] as const;
 let saved: Record<string, string | undefined>;
 let tmpHome: string;
 
@@ -143,6 +154,11 @@ describe('rankOpenAIChatModels — newest PRICED family, tier ladder', () => {
     const { tiers } = rankOpenAIChatModels(['gpt-9.9', 'gpt-5.6']);
     expect(tiers?.deep).toBe('openai:gpt-5.6');
   });
+
+  test('gpt-6.1-sol is priced for metering only: it never becomes a discovered tier default', () => {
+    const { tiers } = rankOpenAIChatModels(['gpt-6.1-sol', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
+    expect(tiers).toMatchObject({ utility: 'openai:gpt-5.6-luna', reasoning: 'openai:gpt-5.6-terra', deep: 'openai:gpt-5.6-sol' });
+  });
 });
 
 describe('refresh + cache + resolution overlay', () => {
@@ -178,6 +194,70 @@ describe('refresh + cache + resolution overlay', () => {
     expect(calls).toBe(1); // fresh cache → throttled
     await refreshLatestOpenAIModels({ env: { OPENAI_API_KEY: 'k' }, fetchImpl: counting, force: true });
     expect(calls).toBe(2);
+  });
+
+  test('a provider-use decline recorded by gbrain setup stops discovery, even forced; acceptance does not', async () => {
+    process.env.CLAUDE_CONFIG_DIR = tmpHome;
+    const receipt = join(tmpHome, '.gbrain-connection-claude-code-gbrain.json');
+    const write = (providers: string) => writeFileSync(receipt, JSON.stringify({
+      harness: 'claude-code', connection: 'local-stdio', setup_receipt_version: 1, status: 'installed', name: 'gbrain',
+      gbrain_home: configDir(), scope: 'user', consent: { providers: { value: providers, source: 'flag' } },
+    }));
+    let calls = 0;
+    const counting = (async () => {
+      calls++;
+      return new Response(JSON.stringify({ data: [{ id: 'gpt-5.6' }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    write('declined');
+    await refreshLatestOpenAIModels({ env: { OPENAI_API_KEY: 'k' }, fetchImpl: counting, force: true });
+    expect(calls).toBe(0);
+    write('accepted');
+    await refreshLatestOpenAIModels({ env: { OPENAI_API_KEY: 'k' }, fetchImpl: counting, force: true });
+    expect(calls).toBe(1);
+  });
+
+  test('concurrent refreshes for the same identity share one fetch', async () => {
+    let calls = 0;
+    let release!: (response: Response) => void;
+    const deferred = (async () => {
+      calls++;
+      return new Promise<Response>((resolve) => { release = resolve; });
+    }) as unknown as typeof fetch;
+    const first = refreshLatestOpenAIModels({
+      env: { OPENAI_API_KEY: 'sk-same-account' }, fetchImpl: deferred, force: true,
+    });
+    const second = refreshLatestOpenAIModels({
+      env: { OPENAI_API_KEY: 'sk-same-account' }, fetchImpl: deferred, force: true,
+    });
+    expect(calls).toBe(1);
+    release(new Response(JSON.stringify({ data: [{ id: 'gpt-5.6' }] }), { status: 200 }));
+    await Promise.all([first, second]);
+    expect(calls).toBe(1);
+  });
+
+  test('concurrent refresh for another identity runs after the pending refresh', async () => {
+    let releaseA!: (response: Response) => void;
+    const fetchA = (async () => new Promise<Response>((resolve) => { releaseA = resolve; })) as unknown as typeof fetch;
+    let callsB = 0;
+    const fetchB = (async () => {
+      callsB++;
+      return new Response(JSON.stringify({ data: [{ id: 'gpt-5.5' }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const refreshA = refreshLatestOpenAIModels({
+      env: { OPENAI_API_KEY: 'sk-account-a' }, fetchImpl: fetchA, force: true,
+    });
+    const refreshB = refreshLatestOpenAIModels({
+      env: { OPENAI_API_KEY: 'sk-account-b' }, fetchImpl: fetchB, force: true,
+    });
+    releaseA(new Response(JSON.stringify({ data: [{ id: 'gpt-5.6' }] }), { status: 200 }));
+    await Promise.all([refreshA, refreshB]);
+
+    expect(callsB).toBe(1);
+    const raw = JSON.parse(readFileSync(join(tmpHome, '.gbrain', 'model-cache.json'), 'utf8'));
+    const fingerprintB = createHash('sha256')
+      .update('https://api.openai.com/v1|sk-account-b').digest('hex').slice(0, 16);
+    expect(raw.openai.fingerprint).toBe(fingerprintB);
   });
 
   test('fail-open: keyless, disabled, HTTP error, and throwing fetch never write or throw', async () => {
@@ -291,6 +371,43 @@ describe('coverage-gap additions (ship review)', () => {
     // Account A's tiers must not serve account B — honest state is the
     // static floor until B's own discovery succeeds.
     expect(latestOpenAITiers()).toBeNull();
+  });
+
+  test('atomic replacement with the same mtime invalidates the memo by inode', async () => {
+    await refreshLatestOpenAIModels({
+      env: { OPENAI_API_KEY: 'sk-account-a' },
+      fetchImpl: fetchReturning(['gpt-5.6']),
+      force: true,
+    });
+    const path = join(tmpHome, '.gbrain', 'model-cache.json');
+    // Pin BOTH files to an integer-second timestamp before priming the memo.
+    // Reusing `before.mtime` through utimesSync is not portable: Linux can
+    // round the source stat's fractional nanoseconds differently from macOS.
+    const fixedSeconds = 1_700_000_000;
+    utimesSync(path, fixedSeconds, fixedSeconds);
+    expect(latestOpenAITiers('deep')).toBe('openai:gpt-5.6'); // prime fixed-mtime memo
+    const before = statSync(path);
+    const replacement = `${path}.external-replacement`;
+    const current = JSON.parse(readFileSync(path, 'utf8'));
+    writeFileSync(replacement, JSON.stringify({
+      ...current,
+      openai: {
+        ...current.openai,
+        tiers: {
+          utility: 'openai:gpt-5.5',
+          reasoning: 'openai:gpt-5.5',
+          deep: 'openai:gpt-5.5',
+          subagent: 'openai:gpt-5.5',
+        },
+      },
+    }, null, 2));
+    utimesSync(replacement, fixedSeconds, fixedSeconds);
+    renameSync(replacement, path);
+
+    const after = statSync(path);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+    expect(after.ino).not.toBe(before.ino);
+    expect(latestOpenAITiers('deep')).toBe('openai:gpt-5.5');
   });
 
   test('failure backoff survives a process boundary (persisted attempt stamp)', async () => {

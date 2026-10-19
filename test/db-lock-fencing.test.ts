@@ -1,12 +1,13 @@
 /**
  * W0 fix-wave (Tier-1 #1, D5.10) — per-acquisition lock fencing.
  *
- * The refresh/release predicates require (id, holder_pid, acquired_at::text),
- * so a handle from a PREVIOUS acquisition — a PID-reuse impostor, or this
- * process after its row was stolen — can never refresh or delete a
- * successor's row. Pre-fix the predicates were (id, holder_pid) only, and an
- * expired holder could refresh a successor's lock while reporting success
- * (Codex eng-review #1 on the fix-wave plan).
+ * The refresh/release predicates require (id, holder_pid, acquisition_token)
+ * (#6028; before that the acquired_at epoch text as well), so a handle from a
+ * PREVIOUS acquisition — a PID-reuse impostor, or this process after its row
+ * was stolen — can never refresh or delete a successor's row. Pre-fix the
+ * predicates were (id, holder_pid) only, and an expired holder could refresh
+ * a successor's lock while reporting success (Codex eng-review #1 on the
+ * fix-wave plan).
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
@@ -30,11 +31,18 @@ beforeEach(async () => {
   await engine.executeRaw(`DELETE FROM gbrain_cycle_locks WHERE id LIKE 'test-fence-%'`);
 });
 
-/** Simulate a successor stealing the row: rewrite acquisition identity in place. */
+/**
+ * Simulate a successor stealing the row: rewrite the acquisition identity in
+ * place. Since v152 every acquisition mints a fresh acquisition_token and that
+ * token is the fence (#6028): a successor's row always carries a new one.
+ * acquired_at moves with it, as a real takeover's does, but is no longer what
+ * the predicate compares (test/db-lock-token-predicate.test.ts pins both).
+ */
 async function stealRow(lockId: string): Promise<void> {
   await engine.executeRaw(
     `UPDATE gbrain_cycle_locks
         SET holder_pid = holder_pid,
+            acquisition_token = gen_random_uuid(),
             acquired_at = acquired_at + INTERVAL '1 millisecond',
             ttl_expires_at = NOW() + INTERVAL '5 minutes',
             last_refreshed_at = NOW()
@@ -99,25 +107,34 @@ describe('startCycleLockRefresher (Tier-1 #1 + D5.11)', () => {
 
   test('aborts the controller with LockStolenError when a fenced refresh returns false', async () => {
     const controller = new AbortController();
+    // Capture what the refresher PASSES to abort() rather than reading it
+    // back off signal.reason: the runtime can deliver `aborted === true`
+    // with `reason === undefined` when abort() runs in a microtask
+    // continuation scheduled from a timer callback — exactly the refresher's
+    // shape (see isLockStolenAbort's docblock; production keys on the
+    // aborted FLAG for the same reason). First observed on a loaded CI shard
+    // (2026-08-16, shard 9); now reproduces locally 2-3 in 5 runs, so the
+    // reason read-back is untestable-by-construction here. The spy pins the
+    // refresher's side of the contract deterministically.
+    const seenReasons: unknown[] = [];
+    const origAbort = controller.abort.bind(controller);
+    controller.abort = ((reason?: unknown) => {
+      seenReasons.push(reason);
+      origAbort(reason);
+    }) as typeof controller.abort;
     const stop = startCycleLockRefresher(fakeLock(async () => false), controller, 'test-lock', 15);
     try {
       // Poll instead of a fixed sleep: under full-suite shard load, timer
       // ticks can be starved well past the nominal interval. Poll on the
-      // REASON, not just `aborted`: one loaded-CI run (2026-08-16, shard 9)
-      // observed `aborted === true` with `reason === undefined` at the first
-      // post-abort read — unreproduced locally/in-container across 50+ runs,
-      // so treat reason visibility as part of the awaited condition and keep
-      // the assertion diagnostic when it genuinely never arrives.
+      // aborted FLAG — the signal production relies on.
       const deadline = Date.now() + 5_000;
-      while (!(controller.signal.reason instanceof LockStolenError) && Date.now() < deadline) {
+      while (!controller.signal.aborted && Date.now() < deadline) {
         await new Promise(r => setTimeout(r, 25));
       }
       expect(controller.signal.aborted).toBe(true);
-      if (!(controller.signal.reason instanceof LockStolenError)) {
-        throw new Error(
-          `expected LockStolenError abort reason within 5s; aborted=${controller.signal.aborted} reason=${String(controller.signal.reason)}`,
-        );
-      }
+      expect(seenReasons).toHaveLength(1);
+      expect(seenReasons[0]).toBeInstanceOf(LockStolenError);
+      expect((seenReasons[0] as LockStolenError).message).toContain('test-lock');
     } finally {
       stop();
     }
@@ -168,6 +185,65 @@ describe('startCycleLockRefresher (Tier-1 #1 + D5.11)', () => {
     const after = calls;
     await new Promise(r => setTimeout(r, 60));
     expect(calls).toBe(after);
+  });
+
+  // #4309: the tick gate used to check ONLY the internal steal controller. An
+  // external abort (opts.signal) with a hung phase never reaches runCycle's
+  // finally, so the leaked timer renewed the fenced lock forever and no
+  // successor could ever take over.
+  test('external abort stops renewals even when stop() is never called (#4309)', async () => {
+    let calls = 0;
+    const controller = new AbortController();
+    const external = new AbortController();
+    const stop = startCycleLockRefresher(
+      fakeLock(async () => { calls++; return true; }),
+      controller, 'test-lock', 15, external.signal,
+    );
+    try {
+      const deadline = Date.now() + 5_000;
+      while (calls === 0 && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 20));
+      }
+      expect(calls).toBeGreaterThan(0); // was renewing while un-aborted
+      external.abort();
+      // Deliberately do NOT call stop() — this is the hung-phase leak shape.
+      const after = calls;
+      await new Promise(r => setTimeout(r, 100));
+      expect(calls).toBe(after);
+      // An external abort is not a steal — the internal controller stays quiet.
+      expect(controller.signal.aborted).toBe(false);
+    } finally {
+      stop();
+    }
+  });
+
+  test('an already-aborted external signal never ticks (#4309)', async () => {
+    let calls = 0;
+    const controller = new AbortController();
+    const external = new AbortController();
+    external.abort();
+    const stop = startCycleLockRefresher(
+      fakeLock(async () => { calls++; return true; }),
+      controller, 'test-lock', 15, external.signal,
+    );
+    try {
+      await new Promise(r => setTimeout(r, 80));
+      expect(calls).toBe(0);
+    } finally {
+      stop();
+    }
+  });
+
+  test('stop() after external abort is safe and idempotent (#4309)', async () => {
+    const controller = new AbortController();
+    const external = new AbortController();
+    const stop = startCycleLockRefresher(
+      fakeLock(async () => true),
+      controller, 'test-lock', 15, external.signal,
+    );
+    external.abort();
+    stop();
+    stop(); // second call must not throw
   });
 });
 
